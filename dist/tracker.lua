@@ -1,0 +1,1 @@
+error("This FishTracker loader path is retired. Use https://raw.githubusercontent.com/dengjiangbin/fish-it/main/tracker.lua only.")
