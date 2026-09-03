@@ -1,4 +1,4 @@
--- Clean Fish Webhook
+-- DENG Fish Webhook
 -- Clean-room replacement based on static behavioral recovery.
 -- No hidden webhooks, license checks, remote code loading, or embedded credentials.
 
@@ -9,7 +9,7 @@ local Config = {
     PlayerWebhook = "",
     EventWebhook = "",
 
-    BotName = "Fish Monitor",
+    BotName = "DENG",
     BotAvatar = "",
     TimezoneOffsetSeconds = 7 * 60 * 60,
 
@@ -42,7 +42,7 @@ local Config = {
     MaximumQueueSize = 50,
     DuplicateWindowSeconds = 8,
     VisibleTextScanInterval = 0.75,
-    ConfigDirectory = "CleanFishWebhook",
+    ConfigDirectory = "DENGFishWebhook",
     ConfigFile = "config.json",
 
     -- Optional manual adapters. Each function receives Runtime and may call:
@@ -50,7 +50,7 @@ local Config = {
     Adapters = {},
 }
 
-local UserConfig = rawget(_G, "CleanFishWebhookConfig")
+local UserConfig = rawget(_G, "DENGFishWebhookConfig")
 if type(UserConfig) == "table" then
     for key, value in pairs(UserConfig) do
         Config[key] = value
@@ -442,7 +442,7 @@ function Runtime.EmitCatch(data)
             color = colorForRarity(data.rarity),
             fields = fields,
             timestamp = timestampIso(),
-            footer = { text = "Clean Fish Webhook v" .. VERSION },
+            footer = { text = "DENG Fish Webhook v" .. VERSION },
         }},
     }
     queueSend(Config.MainWebhook, payload, "catch notification")
@@ -622,7 +622,7 @@ function Runtime.TestWebhook()
         username = safeText(Config.BotName, 80),
         avatar_url = trim(Config.BotAvatar),
         embeds = {{
-            title = "Clean Fish Webhook",
+            title = "DENG Fish Webhook",
             description = "The webhook connection is working.",
             color = 0x3498DB,
             fields = {{ name = "Version", value = VERSION, inline = true }},
@@ -655,8 +655,8 @@ function Runtime.Unload()
             Runtime.Gui:Destroy()
         end)
     end
-    if rawget(_G, "CleanFishWebhook") == Runtime then
-        _G.CleanFishWebhook = nil
+    if rawget(_G, "DENGFishWebhook") == Runtime then
+        _G.DENGFishWebhook = nil
     end
 end
 
@@ -697,7 +697,7 @@ end
 
 local function createGui()
     local gui = Instance.new("ScreenGui")
-    gui.Name = "CleanFishWebhookUI"
+    gui.Name = "DENGFishWebhookUI"
     gui.ResetOnSpawn = false
     gui.IgnoreGuiInset = false
 
@@ -732,7 +732,7 @@ local function createGui()
     title.Font = Enum.Font.GothamBold
     title.TextSize = 16
     title.TextXAlignment = Enum.TextXAlignment.Left
-    title.Text = "Clean Fish Webhook  v" .. VERSION
+    title.Text = "DENG Fish Webhook  v" .. VERSION
     title.Parent = frame
 
     local close = Instance.new("TextButton")
@@ -829,10 +829,10 @@ if type(Config.EnabledRarities) ~= "table" then
     Config.EnabledRarities = {}
 end
 
-if rawget(_G, "CleanFishWebhook") and type(_G.CleanFishWebhook.Unload) == "function" then
-    pcall(_G.CleanFishWebhook.Unload)
+if rawget(_G, "DENGFishWebhook") and type(_G.DENGFishWebhook.Unload) == "function" then
+    pcall(_G.DENGFishWebhook.Unload)
 end
-_G.CleanFishWebhook = Runtime
+_G.DENGFishWebhook = Runtime
 
 installChatWatcher()
 installVisibleTextWatcher()
@@ -841,7 +841,7 @@ for index, adapter in ipairs(type(Config.Adapters) == "table" and Config.Adapter
     if type(adapter) == "function" then
         local ok, result = pcall(adapter, Runtime)
         if not ok then
-            warn("CleanFishWebhook adapter " .. tostring(index) .. " failed")
+            warn("DENGFishWebhook adapter " .. tostring(index) .. " failed")
         elseif type(result) == "userdata" or type(result) == "table" then
             table.insert(Runtime.Connections, result)
         end
@@ -850,7 +850,7 @@ end
 
 local guiOk = pcall(createGui)
 if not guiOk then
-    warn("CleanFishWebhook UI could not be created; runtime API remains available")
+    warn("DENGFishWebhook UI could not be created; runtime API remains available")
 end
 
 setStatus(Request and "Ready — configure your webhook" or "Ready, but this executor has no HTTP request function")
