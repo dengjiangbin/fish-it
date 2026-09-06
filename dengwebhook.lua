@@ -2,7 +2,7 @@
 -- Clean-room replacement based on static behavioral recovery.
 -- No hidden webhooks, license checks, remote code loading, or embedded credentials.
 
-local VERSION = "2.0.0"
+local VERSION = "2.0.1"
 
 local Config = {
     MainWebhook = "",
@@ -25,9 +25,9 @@ local Config = {
 
     MinimumRarity = "Common",
     EnabledRarities = {
-        Common = false,
-        Uncommon = false,
-        Rare = false,
+        Common = true,
+        Uncommon = true,
+        Rare = true,
         Epic = true,
         Legendary = true,
         Mythical = true,
@@ -65,6 +65,7 @@ end
 local Players = game:GetService("Players")
 local HttpService = game:GetService("HttpService")
 local TextChatService = game:GetService("TextChatService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local CoreGui = game:GetService("CoreGui")
 local LocalPlayer = Players.LocalPlayer
 
@@ -403,36 +404,45 @@ end
 
 local function parseCatchText(rawText)
     local text = stripRichText(rawText)
-    if #text < 8 or #text > 600 then
-        return nil
-    end
+    if #text < 3 or #text > 600 then return nil end
     local lowered = lower(text)
-    if not lowered:find("caught", 1, true) and not lowered:find("catch", 1, true) then
-        return nil
+    local catchStart, catchEnd = lowered:find("you caught", 1, true)
+    local player
+    if catchStart then
+        player = LocalPlayer and LocalPlayer.Name or "Unknown"
+    else
+        catchStart, catchEnd = lowered:find("caught", 1, true)
+        if catchStart and catchStart > 1 then player = trim(text:sub(1, catchStart - 1)) end
     end
+    if not catchEnd then
+        local newStart, newEnd = lowered:find("new fish", 1, true)
+        catchStart, catchEnd = newStart, newEnd
+    end
+    if not catchEnd then return nil end
 
-    local player, fish, weight = text:match("^(.+) caught an? (.-) weighing ([%d%.,]+)%s*[Kk][Gg]")
-    if not fish then
-        player, fish, weight = text:match("^(.+) caught an? (.-) %(([%d%.,]+)%s*[Kk][Gg]%)")
+    local fish = trim(text:sub(catchEnd + 1))
+    fish = fish:gsub("^%s*[:%-]%s*", ""):gsub("^[Aa][Nn]?%s+", ""):gsub("^[Tt][Hh][Ee]%s+", "")
+    local weight = fish:match("[%(%[]?([%d%.,]+)%s*[Kk][Gg][%)]?%s*[!%.]*$")
+        or fish:match("[Ww]eighing%s+([%d%.,]+)")
+        or fish:match("%+%s*([%d%.,]+)%s*[Kk]?[Gg]?%s*$")
+    fish = fish:gsub("%s+[Ww]eighing%s+[%d%.,]+%s*[Kk][Gg].*$", "")
+        :gsub("%s*[%(%[]?[%d%.,]+%s*[Kk][Gg][%)]?%s*[!%.]*$", "")
+        :gsub("%s*%+%s*[%d%.,]+%s*[Kk]?[Gg]?%s*$", "")
+        :gsub("%s*[!]+$", "")
+    local mutation = text:match("%[([^%]]+)%]") or text:match("[Mm]utation:?%s*([%w%s%-_]+)")
+    for _, configuredMutation in ipairs(type(Config.CustomMutations) == "table" and Config.CustomMutations or {}) do
+        local prefix = lower(configuredMutation) .. " "
+        if lower(fish):sub(1, #prefix) == prefix then
+            mutation = configuredMutation
+            fish = trim(fish:sub(#prefix + 1))
+            break
+        end
     end
-    if not fish then
-        player, fish, weight = text:match("^(.+) caught:? (.-) %- ([%d%.,]+)%s*[Kk][Gg]")
-    end
-    if not fish then
-        fish, weight = text:match("[Cc]aught:? an? (.-) %(([%d%.,]+)%s*[Kk][Gg]%)")
-    end
-    if not fish then
-        fish = text:match("[Cc]aught:? an? ([^!]+)")
-    end
-    if not fish then
-        return nil
-    end
-
-    fish = normalizeSpace(fish:gsub("%b[]", ""):gsub("%b()", ""))
+    fish = normalizeSpace(fish:gsub("%b[]", ""))
+    if #fish < 2 or not fish:match("%a") then return nil end
     player = normalizeSpace(player or (LocalPlayer and LocalPlayer.Name) or "Unknown")
     weight = weight and weight:gsub(",", ".") or "Unknown"
-    local mutation = text:match("%[([^%]]+)%]") or text:match("[Mm]utation:?%s*([%w%s%-_]+)") or "None"
-    mutation = normalizeSpace(mutation)
+    mutation = normalizeSpace(mutation or "None")
     local rarity = guessRarity(text)
     if listContains(Config.CustomFishNames, fish) or listContains(Config.CustomMutations, mutation) then
         rarity = "Custom"
@@ -691,6 +701,62 @@ local function installVisibleTextWatcher()
             task.wait(clampNumber(Config.VisibleTextScanInterval, 0.25, 5, 0.75))
         end
     end)
+end
+
+local function installCatchRemoteWatcher()
+    local hooked = setmetatable({}, { __mode = "k" })
+    local function emitRecord(name, record, source)
+        if type(name) ~= "string" or trim(name) == "" then return false end
+        record = type(record) == "table" and record or {}
+        local direct = parseCatchText("You caught " .. name) or {}
+        local tierRarity = ({ "Common", "Uncommon", "Rare", "Epic", "Legendary", "Mythical", "Secret", "Forgotten" })[tonumber(record.Tier or record.tier) or 0]
+        direct.player = LocalPlayer and LocalPlayer.Name or "Unknown"
+        direct.fish = direct.fish or normalizeSpace(name)
+        direct.weight = record.Weight or record.weight or record.WeightKg or record.weightKg or direct.weight or "Unknown"
+        direct.mutation = record.Mutation or record.mutation or direct.mutation or "None"
+        direct.rarity = record.Rarity or record.rarity or tierRarity or direct.rarity or guessRarity(name)
+        direct.location = record.Location or record.location or direct.location
+        direct.source = source
+        if direct.weight ~= "Unknown" then direct.weight = tostring(direct.weight) end
+        return Runtime.EmitCatch(direct)
+    end
+    local function inspectArguments(...)
+        local values = { ... }
+        -- Fish It catch packets observed by the recovered pipeline commonly use
+        -- (..., itemName, { Weight = value, ... }). Prefer that typed shape.
+        for index, value in ipairs(values) do
+            if type(value) == "table" then
+                local name = value.FishName or value.fishName or value.ItemName or value.itemName or value.DisplayName or value.displayName or value.Name or value.name
+                if type(name) == "string" and (value.Weight ~= nil or value.weight ~= nil or value.Rarity ~= nil or value.rarity ~= nil) then
+                    if emitRecord(name, value, "remote_record") then return end
+                end
+                local previous = values[index - 1]
+                if type(previous) == "string" and (value.Weight ~= nil or value.weight ~= nil) then
+                    if emitRecord(previous, value, "remote_packet") then return end
+                end
+            end
+        end
+        for _, value in ipairs(values) do
+            if type(value) == "string" then
+                local parsed = parseCatchText(value)
+                if parsed then Runtime.EmitCatch(parsed); return end
+            end
+        end
+    end
+    local function hook(object)
+        if hooked[object] or not object:IsA("RemoteEvent") then return end
+        local name = lower(object.Name)
+        if name:find("analytic", 1, true) or name:find("telemetry", 1, true) then return end
+        hooked[object] = true
+        local ok, connection = pcall(function()
+            return object.OnClientEvent:Connect(function(...)
+                if Runtime.Running then pcall(inspectArguments, ...) end
+            end)
+        end)
+        if ok and connection then trackConnection(connection) end
+    end
+    for _, object in ipairs(ReplicatedStorage:GetDescendants()) do hook(object) end
+    trackConnection(ReplicatedStorage.DescendantAdded:Connect(hook))
 end
 
 local function installAfkTracker()
@@ -1285,6 +1351,7 @@ _G.DENGFishWebhook = Runtime
 
 installChatWatcher()
 installVisibleTextWatcher()
+installCatchRemoteWatcher()
 installAfkTracker()
 
 for index, adapter in ipairs(type(Config.Adapters) == "table" and Config.Adapters or {}) do
