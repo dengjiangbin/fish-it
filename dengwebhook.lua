@@ -2,7 +2,7 @@
 -- Clean-room replacement based on static behavioral recovery.
 -- No hidden webhooks, license checks, remote code loading, or embedded credentials.
 
-local VERSION = "1.0.0"
+local VERSION = "2.0.0"
 
 local Config = {
     MainWebhook = "",
@@ -16,6 +16,10 @@ local Config = {
     CatchNotifications = true,
     PlayerNotifications = false,
     EventNotifications = false,
+    AfkNotifications = false,
+    CrystalNotifications = false,
+    ServerLuckNotifications = false,
+    AdminEventNotifications = false,
     WatchChat = true,
     WatchVisibleText = true,
 
@@ -42,6 +46,7 @@ local Config = {
     MaximumQueueSize = 50,
     DuplicateWindowSeconds = 8,
     VisibleTextScanInterval = 0.75,
+    AfkThresholdSeconds = 300,
     ConfigDirectory = "DENGFishWebhook",
     ConfigFile = "config.json",
 
@@ -75,6 +80,9 @@ local Runtime = {
     SeenText = setmetatable({}, { __mode = "k" }),
     Status = "Starting",
     Gui = nil,
+    Stats = { catches = 0, players = 0, events = 0, crystals = 0, afk = 0, filtered = 0 },
+    LastInputAt = os.clock(),
+    AfkSent = false,
 }
 
 local function trim(value)
@@ -459,6 +467,7 @@ function Runtime.EmitCatch(data)
     data.mutation = safeText(data.mutation or "None", 100)
     data.rarity = normalizeRarity(data.rarity)
     if not catchAllowed(data) then
+        Runtime.Stats.filtered = Runtime.Stats.filtered + 1
         return false, "Catch filtered"
     end
     if duplicateKey({ data.player, data.fish, data.weight, data.mutation, data.rarity }) then
@@ -491,6 +500,7 @@ function Runtime.EmitCatch(data)
         }},
     }
     queueSend(Config.MainWebhook, payload, "catch notification")
+    Runtime.Stats.catches = Runtime.Stats.catches + 1
     return true
 end
 
@@ -511,11 +521,13 @@ function Runtime.EmitPlayer(data)
             description = "**" .. name .. "** " .. action .. " the server.",
             color = action == "joined" and 0x2ECC71 or 0xE74C3C,
             fields = {{ name = "User ID", value = safeText(data.userId or "Unknown", 30), inline = true }},
+            thumbnail = tonumber(data.userId) and { url = "https://www.roblox.com/headshot-thumbnail/image?userId=" .. tostring(data.userId) .. "&width=150&height=150&format=png" } or nil,
             timestamp = timestampIso(),
         }},
     }
     local target = trim(Config.PlayerWebhook) ~= "" and Config.PlayerWebhook or Config.MainWebhook
     queueSend(target, payload, "player notification")
+    Runtime.Stats.players = Runtime.Stats.players + 1
     return true
 end
 
@@ -540,13 +552,98 @@ function Runtime.EmitEvent(data)
     }
     local target = trim(Config.EventWebhook) ~= "" and Config.EventWebhook or Config.MainWebhook
     queueSend(target, payload, "event notification")
+    Runtime.Stats.events = Runtime.Stats.events + 1
     return true
+end
+
+function Runtime.EmitCrystal(data)
+    if not Config.CrystalNotifications or type(data) ~= "table" then
+        return false, "Crystal notifications disabled"
+    end
+    local name = safeText(data.name or "Crystal", 150)
+    local detail = safeText(data.detail or "A crystal event was detected.", 500)
+    if duplicateKey({ "crystal", name, detail }) then
+        return false, "Duplicate crystal event"
+    end
+    local target = trim(Config.EventWebhook) ~= "" and Config.EventWebhook or Config.MainWebhook
+    queueSend(target, {
+        username = safeText(Config.BotName, 80), avatar_url = trim(Config.BotAvatar),
+        embeds = {{ title = name, description = detail, color = 0x42D9C8, timestamp = timestampIso(),
+            footer = { text = "DENG Fish Webhook v" .. VERSION } }},
+    }, "crystal notification")
+    Runtime.Stats.crystals = Runtime.Stats.crystals + 1
+    return true
+end
+
+function Runtime.EmitAFK(data)
+    if not Config.AfkNotifications or type(data) ~= "table" then
+        return false, "AFK notifications disabled"
+    end
+    local name = safeText(data.name or (LocalPlayer and LocalPlayer.Name) or "Player", 100)
+    local seconds = math.floor(clampNumber(data.seconds, 0, 86400, 0))
+    local target = trim(Config.PlayerWebhook) ~= "" and Config.PlayerWebhook or Config.MainWebhook
+    queueSend(target, {
+        username = safeText(Config.BotName, 80), avatar_url = trim(Config.BotAvatar),
+        embeds = {{ title = "Player AFK", description = "**" .. name .. "** has been inactive for " .. tostring(seconds) .. " seconds.",
+            color = 0xF1C40F, timestamp = timestampIso() }},
+    }, "AFK notification")
+    Runtime.Stats.afk = Runtime.Stats.afk + 1
+    return true
+end
+
+Runtime.FishDatabase = {}
+
+function Runtime.RegisterFish(record)
+    if type(record) ~= "table" then return false, "Fish record must be a table" end
+    local name = safeText(record.name, 150)
+    if name == "" then return false, "Fish name is required" end
+    local key = lower(name)
+    Runtime.FishDatabase[key] = {
+        name = name,
+        rarity = normalizeRarity(record.rarity),
+        thumbnail = safeText(record.thumbnail or "", 500),
+        location = safeText(record.location or "", 120),
+    }
+    return true
+end
+
+function Runtime.FindFish(name)
+    return Runtime.FishDatabase[lower(normalizeSpace(name))]
+end
+
+function Runtime.ParseCatchText(text)
+    return parseCatchText(text)
+end
+
+function Runtime.GetPlayerSnapshot()
+    local snapshot = {}
+    for _, player in ipairs(Players:GetPlayers()) do
+        table.insert(snapshot, { name = player.Name, displayName = player.DisplayName, userId = player.UserId })
+    end
+    return snapshot
+end
+
+function Runtime.GetLocationContext()
+    return { placeId = game.PlaceId, jobId = safeText(game.JobId, 100), playerCount = #Players:GetPlayers() }
 end
 
 local function processPossibleCatch(text)
     local data = parseCatchText(text)
     if data then
         Runtime.EmitCatch(data)
+    end
+end
+
+local function processPossibleFeature(text)
+    text = stripRichText(text)
+    processPossibleCatch(text)
+    local lowered = lower(text)
+    if Config.CrystalNotifications and (lowered:find("crystal", 1, true) or lowered:find("gemstone", 1, true)) then
+        Runtime.EmitCrystal({ name = "Crystal Update", detail = text })
+    elseif Config.ServerLuckNotifications and lowered:find("server luck", 1, true) then
+        Runtime.EmitEvent({ name = "Server Luck", state = text })
+    elseif Config.AdminEventNotifications and (lowered:find("admin event", 1, true) or lowered:find("administrator event", 1, true)) then
+        Runtime.EmitEvent({ name = "Administrator Event", state = text })
     end
 end
 
@@ -557,15 +654,15 @@ local function installChatWatcher()
     pcall(function()
         trackConnection(TextChatService.MessageReceived:Connect(function(message)
             if Runtime.Running then
-                processPossibleCatch(message.Text)
+                processPossibleFeature(message.Text)
             end
         end))
     end)
     for _, player in ipairs(Players:GetPlayers()) do
-        trackConnection(player.Chatted:Connect(processPossibleCatch))
+        trackConnection(player.Chatted:Connect(processPossibleFeature))
     end
     trackConnection(Players.PlayerAdded:Connect(function(player)
-        trackConnection(player.Chatted:Connect(processPossibleCatch))
+        trackConnection(player.Chatted:Connect(processPossibleFeature))
         Runtime.EmitPlayer({ action = "joined", name = player.Name, userId = player.UserId })
     end))
     trackConnection(Players.PlayerRemoving:Connect(function(player)
@@ -586,12 +683,31 @@ local function installVisibleTextWatcher()
                         local text = object.Text
                         if Runtime.SeenText[object] ~= text then
                             Runtime.SeenText[object] = text
-                            processPossibleCatch(text)
+                            processPossibleFeature(text)
                         end
                     end
                 end
             end
             task.wait(clampNumber(Config.VisibleTextScanInterval, 0.25, 5, 0.75))
+        end
+    end)
+end
+
+local function installAfkTracker()
+    local UserInputService = game:GetService("UserInputService")
+    trackConnection(UserInputService.InputBegan:Connect(function()
+        Runtime.LastInputAt = os.clock()
+        Runtime.AfkSent = false
+    end))
+    task.spawn(function()
+        while Runtime.Running do
+            local inactive = os.clock() - Runtime.LastInputAt
+            local threshold = clampNumber(Config.AfkThresholdSeconds, 60, 86400, 300)
+            if Config.AfkNotifications and inactive >= threshold and not Runtime.AfkSent then
+                Runtime.AfkSent = true
+                Runtime.EmitAFK({ name = LocalPlayer and LocalPlayer.Name, seconds = inactive })
+            end
+            task.wait(5)
         end
     end)
 end
@@ -613,6 +729,10 @@ local function saveConfig()
         CatchNotifications = Config.CatchNotifications,
         PlayerNotifications = Config.PlayerNotifications,
         EventNotifications = Config.EventNotifications,
+        AfkNotifications = Config.AfkNotifications,
+        CrystalNotifications = Config.CrystalNotifications,
+        ServerLuckNotifications = Config.ServerLuckNotifications,
+        AdminEventNotifications = Config.AdminEventNotifications,
         WatchChat = Config.WatchChat,
         WatchVisibleText = Config.WatchVisibleText,
         EnabledRarities = Config.EnabledRarities,
@@ -620,6 +740,8 @@ local function saveConfig()
         CustomMutations = Config.CustomMutations,
         MentionUserIds = Config.MentionUserIds,
         MentionRoleIds = Config.MentionRoleIds,
+        AllowEveryoneMention = Config.AllowEveryoneMention,
+        AfkThresholdSeconds = Config.AfkThresholdSeconds,
     }
     local body, err = jsonEncode(export)
     if not body then
@@ -648,9 +770,12 @@ local function loadConfig()
         MainWebhook = "string", PlayerWebhook = "string", EventWebhook = "string",
         BotName = "string", BotAvatar = "string", CatchNotifications = "boolean",
         PlayerNotifications = "boolean", EventNotifications = "boolean",
+        AfkNotifications = "boolean", CrystalNotifications = "boolean",
+        ServerLuckNotifications = "boolean", AdminEventNotifications = "boolean",
         WatchChat = "boolean", WatchVisibleText = "boolean", EnabledRarities = "table",
         CustomFishNames = "table", CustomMutations = "table",
         MentionUserIds = "table", MentionRoleIds = "table",
+        AllowEveryoneMention = "boolean", AfkThresholdSeconds = "number",
     }
     for key, value in pairs(decoded) do
         if allowedKeys[key] == type(value) then
@@ -867,6 +992,285 @@ local function createGui()
     end))
 end
 
+-- Full DENG dashboard. The compact v1 builder above is retained only as a
+-- readable fallback reference; this definition is the active interface.
+local function createGui()
+    local palette = {
+        bg = Color3.fromRGB(10, 13, 20), panel = Color3.fromRGB(17, 22, 32),
+        panel2 = Color3.fromRGB(23, 29, 42), input = Color3.fromRGB(29, 36, 51),
+        accent = Color3.fromRGB(71, 196, 255), accent2 = Color3.fromRGB(106, 92, 255),
+        text = Color3.fromRGB(242, 246, 255), muted = Color3.fromRGB(143, 154, 178),
+        good = Color3.fromRGB(62, 207, 142), bad = Color3.fromRGB(235, 91, 104),
+    }
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "DENGFishWebhookUI"
+    gui.ResetOnSpawn = false
+    gui.IgnoreGuiInset = true
+    gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    local parent = CoreGui
+    if type(gethui) == "function" then
+        local ok, result = pcall(gethui)
+        if ok and result then parent = result end
+    elseif LocalPlayer and LocalPlayer:FindFirstChildOfClass("PlayerGui") then
+        parent = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    end
+    gui.Parent = parent
+    Runtime.Gui = gui
+
+    local function corner(object, radius)
+        Instance.new("UICorner", object).CornerRadius = UDim.new(0, radius or 8)
+    end
+    local function stroke(object, color, transparency)
+        local item = Instance.new("UIStroke", object)
+        item.Color = color or Color3.fromRGB(55, 66, 88)
+        item.Transparency = transparency or 0.2
+        return item
+    end
+    local function textLabel(parentObject, text, size, color, bold)
+        local item = Instance.new("TextLabel")
+        item.BackgroundTransparency = 1
+        item.Size = UDim2.new(1, 0, 0, size + 8)
+        item.Text = text
+        item.TextColor3 = color or palette.text
+        item.TextSize = size
+        item.Font = bold and Enum.Font.GothamBold or Enum.Font.Gotham
+        item.TextXAlignment = Enum.TextXAlignment.Left
+        item.TextWrapped = true
+        item.Parent = parentObject
+        return item
+    end
+    local root = Instance.new("Frame")
+    root.Name = "Window"
+    root.Size = UDim2.new(0, 720, 0, 500)
+    root.Position = UDim2.new(0.5, -360, 0.5, -250)
+    root.BackgroundColor3 = palette.bg
+    root.ClipsDescendants = true
+    root.Parent = gui
+    corner(root, 14); stroke(root, Color3.fromRGB(67, 83, 112), 0.1)
+
+    local header = Instance.new("Frame")
+    header.Size = UDim2.new(1, 0, 0, 60)
+    header.BackgroundColor3 = palette.panel
+    header.Parent = root
+    local brand = textLabel(header, "DENG", 20, palette.text, true)
+    brand.Position = UDim2.new(0, 18, 0, 8); brand.Size = UDim2.new(0, 120, 0, 24)
+    local subtitle = textLabel(header, "FISH WEBHOOK  •  v" .. VERSION, 10, palette.accent, true)
+    subtitle.Position = UDim2.new(0, 18, 0, 31); subtitle.Size = UDim2.new(0, 250, 0, 18)
+
+    local minimize = Instance.new("TextButton")
+    minimize.Size = UDim2.new(0, 34, 0, 32); minimize.Position = UDim2.new(1, -76, 0, 14)
+    minimize.BackgroundColor3 = palette.input; minimize.Text = "—"; minimize.TextColor3 = palette.muted
+    minimize.TextSize = 17; minimize.Font = Enum.Font.GothamBold; minimize.Parent = header; corner(minimize, 8)
+    local close = Instance.new("TextButton")
+    close.Size = UDim2.new(0, 34, 0, 32); close.Position = UDim2.new(1, -38, 0, 14)
+    close.BackgroundColor3 = palette.input; close.Text = "×"; close.TextColor3 = palette.bad
+    close.TextSize = 18; close.Font = Enum.Font.GothamBold; close.Parent = header; corner(close, 8)
+    trackConnection(close.MouseButton1Click:Connect(Runtime.Unload))
+
+    local sidebar = Instance.new("Frame")
+    sidebar.Position = UDim2.new(0, 0, 0, 60); sidebar.Size = UDim2.new(0, 158, 1, -60)
+    sidebar.BackgroundColor3 = palette.panel; sidebar.Parent = root
+    local navLayout = Instance.new("UIListLayout", sidebar)
+    navLayout.Padding = UDim.new(0, 7); navLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+    local navPadding = Instance.new("UIPadding", sidebar)
+    navPadding.PaddingTop = UDim.new(0, 15)
+
+    local content = Instance.new("Frame")
+    content.Position = UDim2.new(0, 158, 0, 60); content.Size = UDim2.new(1, -158, 1, -96)
+    content.BackgroundTransparency = 1; content.Parent = root
+    local statusBar = Instance.new("TextLabel")
+    statusBar.Position = UDim2.new(0, 170, 1, -30); statusBar.Size = UDim2.new(1, -184, 0, 22)
+    statusBar.BackgroundTransparency = 1; statusBar.Text = Runtime.Status; statusBar.TextColor3 = palette.muted
+    statusBar.TextSize = 11; statusBar.Font = Enum.Font.Gotham; statusBar.TextXAlignment = Enum.TextXAlignment.Left
+    statusBar.TextTruncate = Enum.TextTruncate.AtEnd; statusBar.Parent = root
+    Runtime.StatusLabel = statusBar
+
+    local pages, navButtons = {}, {}
+    local activePage
+    local function newPage(name, description)
+        local page = Instance.new("ScrollingFrame")
+        page.Name = name; page.Size = UDim2.new(1, 0, 1, 0); page.BackgroundTransparency = 1
+        page.BorderSizePixel = 0; page.ScrollBarThickness = 3; page.ScrollBarImageColor3 = palette.accent
+        page.AutomaticCanvasSize = Enum.AutomaticSize.Y; page.CanvasSize = UDim2.new(); page.Visible = false; page.Parent = content
+        local layout = Instance.new("UIListLayout", page); layout.Padding = UDim.new(0, 10); layout.SortOrder = Enum.SortOrder.LayoutOrder
+        local padding = Instance.new("UIPadding", page)
+        padding.PaddingTop = UDim.new(0, 16); padding.PaddingBottom = UDim.new(0, 16)
+        padding.PaddingLeft = UDim.new(0, 16); padding.PaddingRight = UDim.new(0, 16)
+        textLabel(page, name, 22, palette.text, true)
+        local desc = textLabel(page, description, 11, palette.muted, false); desc.Size = UDim2.new(1, 0, 0, 32)
+        pages[name] = page
+        return page
+    end
+    local function showPage(name)
+        activePage = name
+        for key, page in pairs(pages) do page.Visible = key == name end
+        for key, button in pairs(navButtons) do
+            button.BackgroundColor3 = key == name and palette.input or palette.panel
+            button.TextColor3 = key == name and palette.accent or palette.muted
+        end
+    end
+    local function nav(name)
+        local button = Instance.new("TextButton")
+        button.Size = UDim2.new(1, -18, 0, 38); button.BackgroundColor3 = palette.panel
+        button.Text = "  " .. name; button.TextColor3 = palette.muted; button.TextSize = 12
+        button.Font = Enum.Font.GothamMedium; button.TextXAlignment = Enum.TextXAlignment.Left
+        button.Parent = sidebar; corner(button, 8); navButtons[name] = button
+        trackConnection(button.MouseButton1Click:Connect(function() showPage(name) end))
+    end
+    local function card(parentObject, titleText)
+        local box = Instance.new("Frame")
+        box.Size = UDim2.new(1, 0, 0, 54); box.AutomaticSize = Enum.AutomaticSize.Y
+        box.BackgroundColor3 = palette.panel2; box.Parent = parentObject; corner(box, 10); stroke(box, nil, 0.5)
+        local layout = Instance.new("UIListLayout", box); layout.Padding = UDim.new(0, 8); layout.SortOrder = Enum.SortOrder.LayoutOrder
+        local pad = Instance.new("UIPadding", box)
+        pad.PaddingTop = UDim.new(0, 12); pad.PaddingBottom = UDim.new(0, 12)
+        pad.PaddingLeft = UDim.new(0, 12); pad.PaddingRight = UDim.new(0, 12)
+        if titleText then textLabel(box, titleText, 13, palette.text, true) end
+        return box
+    end
+    local function input(parentObject, labelText, initial, callback, secret)
+        local box = card(parentObject, labelText)
+        local field = Instance.new("TextBox")
+        field.Size = UDim2.new(1, 0, 0, 36); field.BackgroundColor3 = palette.input
+        field.Text = secret and (trim(initial) ~= "" and "Webhook configured — replace to change" or "") or tostring(initial or "")
+        field.PlaceholderText = secret and "Paste Discord webhook URL" or labelText
+        field.TextColor3 = palette.text; field.PlaceholderColor3 = palette.muted; field.TextSize = 11
+        field.Font = Enum.Font.Code; field.TextXAlignment = Enum.TextXAlignment.Left; field.ClearTextOnFocus = secret
+        field.Parent = box; corner(field, 7)
+        local pad = Instance.new("UIPadding", field); pad.PaddingLeft = UDim.new(0, 10); pad.PaddingRight = UDim.new(0, 10)
+        trackConnection(field.FocusLost:Connect(function()
+            callback(field.Text, field)
+        end))
+        return field
+    end
+    local function toggle(parentObject, labelText, getter, setter)
+        local row = Instance.new("TextButton")
+        row.Size = UDim2.new(1, 0, 0, 42); row.BackgroundColor3 = palette.input
+        row.TextColor3 = palette.text; row.TextSize = 12; row.Font = Enum.Font.GothamMedium
+        row.TextXAlignment = Enum.TextXAlignment.Left; row.Parent = parentObject; corner(row, 8)
+        local pad = Instance.new("UIPadding", row); pad.PaddingLeft = UDim.new(0, 11); pad.PaddingRight = UDim.new(0, 11)
+        local function refresh() row.Text = labelText .. (getter() and "                                      ON" or "                                      OFF"); row.TextColor3 = getter() and palette.good or palette.muted end
+        refresh()
+        trackConnection(row.MouseButton1Click:Connect(function() setter(not getter()); refresh() end))
+        return row
+    end
+    local function button(parentObject, labelText, callback, danger)
+        local item = Instance.new("TextButton")
+        item.Size = UDim2.new(1, 0, 0, 38); item.BackgroundColor3 = danger and Color3.fromRGB(75, 31, 39) or palette.input
+        item.Text = labelText; item.TextColor3 = danger and palette.bad or palette.accent
+        item.TextSize = 12; item.Font = Enum.Font.GothamBold; item.Parent = parentObject; corner(item, 8)
+        trackConnection(item.MouseButton1Click:Connect(callback)); return item
+    end
+    local function splitCsv(value, maximum)
+        local result, seen = {}, {}
+        for part in tostring(value or ""):gmatch("[^,\n]+") do
+            local item = safeText(part, 100)
+            local key = lower(item)
+            if item ~= "" and not seen[key] and #result < (maximum or 100) then
+                seen[key] = true; table.insert(result, item)
+            end
+        end
+        return result
+    end
+    local function webhookInput(page, labelText, key)
+        input(page, labelText, Config[key], function(value, field)
+            if trim(value) == "" then Config[key] = ""; field.Text = ""; setStatus(labelText .. " cleared"); return end
+            local normalized, err = validateWebhook(value)
+            if normalized then Config[key] = normalized; field.Text = "Webhook configured — replace to change"; setStatus(labelText .. " accepted: " .. maskWebhook(normalized))
+            else field.Text = Config[key] ~= "" and "Webhook configured — replace to change" or ""; setStatus("Invalid webhook: " .. err) end
+        end, true)
+    end
+
+    local overview = newPage("Overview", "Live status, delivery queue, player context, and module health.")
+    local overviewCard = card(overview, "Runtime status")
+    local overviewText = textLabel(overviewCard, "", 12, palette.muted, false); overviewText.Size = UDim2.new(1, 0, 0, 90)
+    local function refreshOverview()
+        overviewText.Text = string.format("Player: %s\nPlayers in server: %d   •   Queue: %d\nSent: %d catches, %d player, %d event, %d crystal, %d AFK\nFiltered catches: %d",
+            LocalPlayer and LocalPlayer.Name or "Unavailable", #Players:GetPlayers(), #Runtime.Queue,
+            Runtime.Stats.catches, Runtime.Stats.players, Runtime.Stats.events, Runtime.Stats.crystals, Runtime.Stats.afk, Runtime.Stats.filtered)
+    end
+    refreshOverview(); button(overview, "Refresh dashboard", refreshOverview)
+    local safety = card(overview, "Safety profile")
+    textLabel(safety, "No embedded webhook • No license lock • No hidden logging • No remote code update • Credentials masked in status", 11, palette.good, false).Size = UDim2.new(1, 0, 0, 38)
+
+    local webhooks = newPage("Webhooks", "Configure visible destinations. Empty specialized destinations fall back to Main.")
+    webhookInput(webhooks, "Main webhook", "MainWebhook")
+    webhookInput(webhooks, "Player webhook", "PlayerWebhook")
+    webhookInput(webhooks, "Event webhook", "EventWebhook")
+    input(webhooks, "Webhook display name", Config.BotName, function(value, field) Config.BotName = safeText(value, 80); field.Text = Config.BotName end)
+    input(webhooks, "Webhook avatar URL", Config.BotAvatar, function(value, field) Config.BotAvatar = trim(value); field.Text = Config.BotAvatar end)
+    button(webhooks, "Send test notification", Runtime.TestWebhook)
+
+    local catches = newPage("Catches", "Catch parser, rarity routing, custom fish, mutations, and source watchers.")
+    local sourceCard = card(catches, "Detection sources")
+    toggle(sourceCard, "Catch notifications", function() return Config.CatchNotifications end, function(v) Config.CatchNotifications = v end)
+    toggle(sourceCard, "Watch chat messages", function() return Config.WatchChat end, function(v) Config.WatchChat = v end)
+    toggle(sourceCard, "Watch visible game text", function() return Config.WatchVisibleText end, function(v) Config.WatchVisibleText = v end)
+    local rarityCard = card(catches, "Rarity filters")
+    for _, rarity in ipairs({ "Common", "Uncommon", "Rare", "Epic", "Legendary", "Mythical", "Secret", "Forgotten", "Custom" }) do
+        toggle(rarityCard, rarity, function() return Config.EnabledRarities[rarity] == true end, function(v) Config.EnabledRarities[rarity] = v end)
+    end
+    input(catches, "Custom fish names (comma separated)", table.concat(Config.CustomFishNames, ", "), function(value, field) Config.CustomFishNames = splitCsv(value, 200); field.Text = table.concat(Config.CustomFishNames, ", ") end)
+    input(catches, "Custom mutations (comma separated)", table.concat(Config.CustomMutations, ", "), function(value, field) Config.CustomMutations = splitCsv(value, 200); field.Text = table.concat(Config.CustomMutations, ", ") end)
+
+    local playersPage = newPage("Players", "Join, leave, avatar-ready identity, and inactivity monitoring.")
+    local playerCard = card(playersPage, "Player tracking")
+    toggle(playerCard, "Join and leave notifications", function() return Config.PlayerNotifications end, function(v) Config.PlayerNotifications = v end)
+    toggle(playerCard, "AFK notifications", function() return Config.AfkNotifications end, function(v) Config.AfkNotifications = v end)
+    input(playersPage, "AFK threshold in seconds", Config.AfkThresholdSeconds, function(value, field) Config.AfkThresholdSeconds = clampNumber(value, 60, 86400, 300); field.Text = tostring(Config.AfkThresholdSeconds) end)
+    button(playersPage, "Test player notification", function()
+        Runtime.EmitPlayer({ action = "joined", name = LocalPlayer and LocalPlayer.Name or "DENG Test", userId = LocalPlayer and LocalPlayer.UserId or 0 })
+    end)
+    button(playersPage, "Test AFK notification", function() Runtime.EmitAFK({ name = LocalPlayer and LocalPlayer.Name or "DENG Test", seconds = Config.AfkThresholdSeconds }) end)
+
+    local eventsPage = newPage("Events", "General, administrator, server-luck, and crystal transition notifications.")
+    local eventCard = card(eventsPage, "Event modules")
+    toggle(eventCard, "General event notifications", function() return Config.EventNotifications end, function(v) Config.EventNotifications = v end)
+    toggle(eventCard, "Server luck detection", function() return Config.ServerLuckNotifications end, function(v) Config.ServerLuckNotifications = v; if v then Config.EventNotifications = true end end)
+    toggle(eventCard, "Administrator event detection", function() return Config.AdminEventNotifications end, function(v) Config.AdminEventNotifications = v; if v then Config.EventNotifications = true end end)
+    toggle(eventCard, "Crystal and gemstone detection", function() return Config.CrystalNotifications end, function(v) Config.CrystalNotifications = v end)
+    button(eventsPage, "Test general event", function() Runtime.EmitEvent({ name = "DENG Event Test", state = "active" }) end)
+    button(eventsPage, "Test crystal event", function() Runtime.EmitCrystal({ name = "DENG Crystal Test", detail = "Crystal notification routing is working." }) end)
+
+    local settings = newPage("Settings", "Mentions, persistence, lifecycle, and manual integration API.")
+    input(settings, "Discord user IDs (comma separated)", table.concat(Config.MentionUserIds, ", "), function(value, field) Config.MentionUserIds = normalizeSnowflakeList(splitCsv(value, 50)); field.Text = table.concat(Config.MentionUserIds, ", ") end)
+    input(settings, "Discord role IDs (comma separated)", table.concat(Config.MentionRoleIds, ", "), function(value, field) Config.MentionRoleIds = normalizeSnowflakeList(splitCsv(value, 50)); field.Text = table.concat(Config.MentionRoleIds, ", ") end)
+    local mentionCard = card(settings, "Mention policy")
+    toggle(mentionCard, "Allow @everyone", function() return Config.AllowEveryoneMention end, function(v) Config.AllowEveryoneMention = v end)
+    button(settings, "Save configuration", Runtime.SaveConfig)
+    button(settings, "Reload saved configuration", function() local ok, err = loadConfig(); setStatus(ok and "Configuration reloaded" or tostring(err)) end)
+    button(settings, "Unload DENG Fish Webhook", Runtime.Unload, true)
+    local apiCard = card(settings, "Manual adapter API")
+    textLabel(apiCard, "_G.DENGFishWebhook.EmitCatch(data)\n_G.DENGFishWebhook.EmitPlayer(data)\n_G.DENGFishWebhook.EmitEvent(data)\n_G.DENGFishWebhook.EmitCrystal(data)", 11, palette.muted, false).Size = UDim2.new(1, 0, 0, 72)
+
+    for _, name in ipairs({ "Overview", "Webhooks", "Catches", "Players", "Events", "Settings" }) do nav(name) end
+    showPage("Overview")
+
+    local collapsed = false
+    trackConnection(minimize.MouseButton1Click:Connect(function()
+        collapsed = not collapsed
+        sidebar.Visible = not collapsed; content.Visible = not collapsed; statusBar.Visible = not collapsed
+        root.Size = collapsed and UDim2.new(0, 260, 0, 60) or UDim2.new(0, 720, 0, 500)
+        minimize.Text = collapsed and "+" or "—"
+    end))
+    local dragging, dragStart, startPosition = false, nil, nil
+    trackConnection(header.InputBegan:Connect(function(inputObject)
+        if inputObject.UserInputType == Enum.UserInputType.MouseButton1 or inputObject.UserInputType == Enum.UserInputType.Touch then
+            dragging = true; dragStart = inputObject.Position; startPosition = root.Position
+        end
+    end))
+    trackConnection(header.InputEnded:Connect(function(inputObject)
+        if inputObject.UserInputType == Enum.UserInputType.MouseButton1 or inputObject.UserInputType == Enum.UserInputType.Touch then dragging = false end
+    end))
+    local UserInputService = game:GetService("UserInputService")
+    trackConnection(UserInputService.InputChanged:Connect(function(inputObject)
+        if dragging and (inputObject.UserInputType == Enum.UserInputType.MouseMovement or inputObject.UserInputType == Enum.UserInputType.Touch) then
+            local delta = inputObject.Position - dragStart
+            root.Position = UDim2.new(startPosition.X.Scale, startPosition.X.Offset + delta.X, startPosition.Y.Scale, startPosition.Y.Offset + delta.Y)
+        end
+    end))
+end
+
 loadConfig()
 Config.MentionUserIds = normalizeSnowflakeList(Config.MentionUserIds)
 Config.MentionRoleIds = normalizeSnowflakeList(Config.MentionRoleIds)
@@ -881,6 +1285,7 @@ _G.DENGFishWebhook = Runtime
 
 installChatWatcher()
 installVisibleTextWatcher()
+installAfkTracker()
 
 for index, adapter in ipairs(type(Config.Adapters) == "table" and Config.Adapters or {}) do
     if type(adapter) == "function" then
