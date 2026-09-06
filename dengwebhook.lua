@@ -1,11 +1,11 @@
 -- DENG Fish Webhook
--- Clean-room replacement based on static behavioral recovery.
--- No hidden webhooks, license checks, remote code loading, or embedded credentials.
+-- DENG-branded Fish It notification dashboard.
+-- Reconstructed from the recovered feature map.
 
-local VERSION = "2.3.0"
+local VERSION = "2.4.0"
 
 local Config = {
-    SchemaVersion = 2,
+    SchemaVersion = 3,
     MainWebhook = "",
     PlayerWebhook = "",
     EventWebhook = "",
@@ -14,9 +14,9 @@ local Config = {
     BotName = "DENG",
     BotAvatar = "",
     EmbedLayout = 1,
-    CatchTitleTemplate = "{rarity} Fish Caught",
-    CatchDescriptionTemplate = "{player} caught {fish}.",
-    FooterTemplate = "DENG Fish Webhook • {date}",
+    CatchTitleTemplate = "{player} dapett ikann!",
+    CatchDescriptionTemplate = "imupp {player} dapat ikann **{fish}** !",
+    FooterTemplate = "DENG Fish It",
     NotificationPrefix = "",
     DefaultFishThumbnail = "https://i.ibb.co.com/q38LKrcJ/image.png",
     TimezoneOffsetSeconds = 7 * 60 * 60,
@@ -122,6 +122,13 @@ local function safeText(value, maximum)
     if #value > maximum then
         value = value:sub(1, maximum - 3) .. "..."
     end
+    return value
+end
+
+local function safeMultiline(value, maximum)
+    value = tostring(value or ""):gsub("\r\n", "\n"):gsub("\r", "\n")
+    value = value:gsub("@everyone", "@ everyone"):gsub("@here", "@ here")
+    if #value > maximum then value = value:sub(1, maximum - 3) .. "..." end
     return value
 end
 
@@ -411,6 +418,13 @@ local function assetThumbnail(value)
     return nil
 end
 
+local function formatWeight(value)
+    local text = safeText(value or "Unknown", 50)
+    if text == "Unknown" then return text end
+    if lower(text):match("%s*k?g%s*$") then return text end
+    return text .. " kg"
+end
+
 local function duplicateKey(parts)
     local value = table.concat(parts, "|"):lower()
     local now = os.clock()
@@ -526,30 +540,39 @@ function Runtime.EmitCatch(data)
         or Config.DefaultFishThumbnail
     local variables = {
         player = data.player, fish = data.fish, weight = data.weight, mutation = data.mutation,
-        rarity = data.rarity, location = data.location or "Unknown", date = jakartaDate(), version = VERSION,
+        rarity = data.rarity, chance = data.chance or (fishRecord and fishRecord.chance) or "Unknown",
+        location = data.location or (fishRecord and fishRecord.location) or "Unknown", date = jakartaDate(), version = VERSION,
     }
     local fields = {
-        { name = "Fish", value = data.fish, inline = true },
-        { name = "Rarity", value = data.rarity, inline = true },
-        { name = "Weight", value = data.weight == "Unknown" and data.weight or data.weight .. " kg", inline = true },
-        { name = "Mutation", value = data.mutation, inline = true },
-        { name = "Player", value = data.player, inline = true },
+        { name = "💞 Player", value = data.player, inline = false },
+        { name = "💞 Fish Name", value = data.fish, inline = false },
+        { name = "💞 Mutation", value = data.mutation == "None" and "-" or data.mutation, inline = false },
+        { name = "💞 Weight", value = formatWeight(data.weight), inline = false },
+        { name = "💞 Rarity", value = data.rarity, inline = false },
+        { name = "💞 Chance", value = safeText(variables.chance, 80), inline = false },
+        { name = "💞 Map", value = safeText(variables.location, 120), inline = false },
     }
-    if data.location and trim(data.location) ~= "" then
-        table.insert(fields, { name = "Location", value = safeText(data.location, 120), inline = true })
-    end
     local mentionUsers = normalizeSnowflakeList(Config.MentionUserIds)
     local mentionRoles = normalizeSnowflakeList(Config.MentionRoleIds)
     local title = applyTemplate(Config.CatchTitleTemplate, variables)
     local description = applyTemplate(Config.CatchDescriptionTemplate, variables)
     local footer = applyTemplate(Config.FooterTemplate, variables)
+    local detailLines = {
+        "💞 **Player:** `" .. data.player .. "`",
+        "💞 **Fish Name:** `" .. data.fish .. "`",
+        "💞 **Mutation:** `" .. (data.mutation == "None" and "-" or data.mutation) .. "`",
+        "💞 **Weight:** `" .. formatWeight(data.weight) .. "`",
+        "💞 **Rarity:** `" .. data.rarity .. "`",
+        "💞 **Chance:** `" .. safeText(variables.chance, 80) .. "`",
+        "💞 **Map:** `" .. safeText(variables.location, 120) .. "`",
+    }
     local layout = math.floor(clampNumber(Config.EmbedLayout, 1, 3, 1))
     local embed
     if layout == 2 then
         embed = {
             author = { name = Config.NotificationPrefix ~= "" and Config.NotificationPrefix .. " DENG Fish It" or "DENG Fish It" },
             title = title,
-            description = description .. "\n\n**Weight:** " .. variables.weight .. (variables.weight == "Unknown" and "" or " kg")
+            description = description .. "\n\n**Weight:** " .. formatWeight(variables.weight)
                 .. "\n**Mutation:** " .. variables.mutation .. "\n**Location:** " .. variables.location,
             color = colorForRarity(data.rarity), thumbnail = { url = thumbnail }, timestamp = timestampIso(),
             footer = { text = footer },
@@ -564,7 +587,7 @@ function Runtime.EmitCatch(data)
     else
         embed = {
             title = (Config.NotificationPrefix ~= "" and Config.NotificationPrefix .. " " or "") .. title,
-            description = description, color = colorForRarity(data.rarity), fields = fields,
+            description = description .. "\n\n" .. table.concat(detailLines, "\n"), color = colorForRarity(data.rarity),
             thumbnail = { url = thumbnail }, timestamp = timestampIso(), footer = { text = footer },
         }
     end
@@ -655,6 +678,60 @@ function Runtime.EmitPlayer(data)
     return true
 end
 
+local function compactNumber(value)
+    local number = tonumber(value)
+    if not number then return safeText(value or "-", 30) end
+    local units = { { 1e9, "B" }, { 1e6, "M" }, { 1e3, "K" } }
+    for _, unit in ipairs(units) do
+        if math.abs(number) >= unit[1] then
+            local shown = string.format("%.1f", number / unit[1]):gsub("%.0$", "")
+            return shown .. unit[2]
+        end
+    end
+    return tostring(math.floor(number + 0.5))
+end
+
+local function playerFishingValue(player)
+    local leaderstats = player and player:FindFirstChild("leaderstats")
+    if leaderstats then
+        for _, key in ipairs({ "Weight", "TotalWeight", "Fish", "Caught", "FishCaught" }) do
+            local node = leaderstats:FindFirstChild(key)
+            if node and node:IsA("ValueBase") then return compactNumber(node.Value) end
+        end
+    end
+    for _, key in ipairs({ "Weight", "TotalWeight", "FishCaught" }) do
+        local value = player and player:GetAttribute(key)
+        if value ~= nil then return compactNumber(value) end
+    end
+    return "-"
+end
+
+local function playerMapName(player)
+    for _, key in ipairs({ "Location", "Map", "Zone", "Area" }) do
+        local value = player and player:GetAttribute(key)
+        if value ~= nil and trim(value) ~= "" then return safeText(value, 80) end
+    end
+    return "-"
+end
+
+function Runtime.EmitPlayerList()
+    if not Config.PlayerNotifications then return false, "Player notifications disabled" end
+    local lines = {}
+    for _, player in ipairs(Players:GetPlayers()) do
+        table.insert(lines, "💞 `" .. safeText(player.Name, 50) .. "` - 🎣: `" .. playerFishingValue(player) .. "` - 🗺️ `" .. playerMapName(player) .. "`")
+    end
+    local target = trim(Config.PlayerWebhook) ~= "" and Config.PlayerWebhook or Config.MainWebhook
+    queueSend(target, {
+        username = safeText(Config.BotName, 80), avatar_url = trim(Config.BotAvatar),
+        embeds = {{
+            title = "Check Player On Server",
+            description = "Total player aktif: **" .. tostring(#lines) .. "**\n\n" .. safeMultiline(table.concat(lines, "\n"), 3900),
+            color = 0x3498DB, timestamp = timestampIso(), footer = { text = "DENG Fish It" },
+        }},
+    }, "player list")
+    return true
+end
+
 function Runtime.EmitEvent(data)
     if type(data) ~= "table" or (not Config.EventNotifications and not data.featureEnabled) then
         return false, "Event notifications disabled"
@@ -728,6 +805,7 @@ function Runtime.RegisterFish(record)
         thumbnail = safeText(record.thumbnail or record.image or record.icon or record.assetId or "", 500),
         location = safeText(record.location or "", 120),
         value = tonumber(record.value) or nil,
+        chance = safeText(record.chance or record.probability or "", 80),
     }
     return true
 end
@@ -845,10 +923,21 @@ local function installChatWatcher()
     end
     trackConnection(Players.PlayerAdded:Connect(function(player)
         trackConnection(player.Chatted:Connect(processPossibleFeature))
-        Runtime.EmitPlayer({ action = "joined", name = player.Name, userId = player.UserId })
+    end))
+end
+
+local function installPlayerWatcher()
+    trackConnection(Players.PlayerAdded:Connect(function(player)
+        if Config.PlayerNotifications then
+            Runtime.EmitPlayer({ action = "joined", name = player.Name, userId = player.UserId })
+            task.delay(1, function() if Runtime.Running then Runtime.EmitPlayerList() end end)
+        end
     end))
     trackConnection(Players.PlayerRemoving:Connect(function(player)
-        Runtime.EmitPlayer({ action = "left", name = player.Name, userId = player.UserId })
+        if Config.PlayerNotifications then
+            Runtime.EmitPlayer({ action = "left", name = player.Name, userId = player.UserId })
+            task.delay(1, function() if Runtime.Running then Runtime.EmitPlayerList() end end)
+        end
     end))
 end
 
@@ -893,6 +982,7 @@ local function installCatchRemoteWatcher()
         direct.mutation = record.Mutation or record.mutation or direct.mutation or "None"
         direct.rarity = record.Rarity or record.rarity or tierRarity or direct.rarity or guessRarity(name)
         direct.location = record.Location or record.location or direct.location
+        direct.chance = record.Chance or record.chance or record.Probability or record.probability or record.Odds or record.odds
         direct.thumbnail = record.Thumbnail or record.thumbnail or record.Image or record.image
             or record.Icon or record.icon or record.AssetId or record.assetId
         direct.source = source
@@ -903,6 +993,7 @@ local function installCatchRemoteWatcher()
             thumbnail = direct.thumbnail,
             location = direct.location,
             value = record.Value or record.value or record.Price or record.price,
+            chance = direct.chance,
         })
         local global = record.Global == true or record.global == true or record.IsGlobal == true or record.isGlobal == true
             or lower(source):find("global", 1, true) ~= nil
@@ -974,7 +1065,8 @@ local function registerFishInstance(object)
     local thumbnail = readAttribute(object, { "Thumbnail", "thumbnail", "Image", "image", "Icon", "icon", "AssetId", "assetId" })
     local location = readAttribute(object, { "Location", "location", "Zone", "zone" })
     local value = readAttribute(object, { "Value", "value", "Price", "price", "SellPrice", "sellPrice" })
-    if not explicitName and not rarity and not tier and not thumbnail and not location and not value then return false end
+    local chance = readAttribute(object, { "Chance", "chance", "Probability", "probability", "Odds", "odds" })
+    if not explicitName and not rarity and not tier and not thumbnail and not location and not value and not chance then return false end
     if not explicitName and not rarity and not tier then return false end
     local tierRarity = ({ "Common", "Uncommon", "Rare", "Epic", "Legendary", "Mythical", "Secret", "Forgotten" })[tier or 0]
     return Runtime.RegisterFish({
@@ -983,6 +1075,7 @@ local function registerFishInstance(object)
         thumbnail = thumbnail,
         location = location,
         value = value,
+        chance = chance,
     })
 end
 
@@ -1103,6 +1196,12 @@ local function loadConfig()
         Config.WatchChat = false
         Config.WatchVisibleText = false
         Config.SchemaVersion = 2
+    end
+    if tonumber(decoded.SchemaVersion or 0) < 3 then
+        if Config.CatchTitleTemplate == "{rarity} Fish Caught" then Config.CatchTitleTemplate = "{player} dapett ikann!" end
+        if Config.CatchDescriptionTemplate == "{player} caught {fish}." then Config.CatchDescriptionTemplate = "imupp {player} dapat ikann **{fish}** !" end
+        if Config.FooterTemplate == "DENG Fish Webhook • {date}" then Config.FooterTemplate = "DENG Fish It" end
+        Config.SchemaVersion = 3
     end
     Config.MentionUserIds = normalizeSnowflakeList(Config.MentionUserIds)
     Config.MentionRoleIds = normalizeSnowflakeList(Config.MentionRoleIds)
@@ -1512,9 +1611,6 @@ local function createGui()
             Runtime.Stats.catches, Runtime.Stats.globalCatches, Runtime.Stats.players, Runtime.Stats.events, Runtime.Stats.crystals, Runtime.Stats.afk, Runtime.Stats.filtered)
     end
     refreshOverview(); button(overview, "Refresh dashboard", refreshOverview)
-    local safety = card(overview, "Safety profile")
-    textLabel(safety, "No embedded webhook • No license lock • No hidden logging • No remote code update • Credentials masked in status", 11, palette.good, false).Size = UDim2.new(1, 0, 0, 38)
-
     local webhooks = newPage("Webhooks", "Configure visible destinations. Empty specialized destinations fall back to Main.")
     webhookInput(webhooks, "Main webhook", "MainWebhook")
     webhookInput(webhooks, "Player webhook", "PlayerWebhook")
@@ -1556,6 +1652,7 @@ local function createGui()
         Runtime.EmitPlayer({ action = "joined", name = LocalPlayer and LocalPlayer.Name or "DENG Test", userId = LocalPlayer and LocalPlayer.UserId or 0 })
     end)
     button(playersPage, "Test AFK notification", function() Runtime.EmitAFK({ name = LocalPlayer and LocalPlayer.Name or "DENG Test", seconds = Config.AfkThresholdSeconds }) end)
+    button(playersPage, "Send player list", Runtime.EmitPlayerList)
 
     local eventsPage = newPage("Events", "General, administrator, server-luck, and crystal transition notifications.")
     local eventCard = card(eventsPage, "Event modules")
@@ -1618,6 +1715,7 @@ end
 _G.DENGFishWebhook = Runtime
 
 installChatWatcher()
+installPlayerWatcher()
 installVisibleTextWatcher()
 installFishDatabaseWatcher()
 installCatchRemoteWatcher()
