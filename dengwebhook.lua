@@ -2,7 +2,7 @@
 -- Clean-room replacement based on static behavioral recovery.
 -- No hidden webhooks, license checks, remote code loading, or embedded credentials.
 
-local VERSION = "2.2.0"
+local VERSION = "2.2.1"
 
 local Config = {
     MainWebhook = "",
@@ -90,7 +90,7 @@ local Runtime = {
     Status = "Starting",
     Gui = nil,
     Stats = { catches = 0, globalCatches = 0, players = 0, events = 0, crystals = 0, afk = 0, filtered = 0 },
-    FeatureState = { serverLuck = nil, adminEvents = {} },
+    FeatureState = { serverLuck = nil, serverLuckTimer = nil, adminEvents = {}, adminSeenAt = {} },
     LastInputAt = os.clock(),
     AfkSent = false,
 }
@@ -790,7 +790,8 @@ syncServerLuck = function(text)
     if not Config.ServerLuckNotifications then return end
     local info = parseServerLuck(text)
     if not info then return end
-    local identity = info.multiplier .. "|" .. info.timer
+    local identity = lower(info.multiplier)
+    Runtime.FeatureState.serverLuckTimer = info.timer
     if Runtime.FeatureState.serverLuck == identity then return end
     Runtime.FeatureState.serverLuck = identity
     Runtime.EmitEvent({ name = "Server Luck x" .. info.multiplier, state = info.timer == "Unknown" and "active" or info.timer, featureEnabled = true })
@@ -802,9 +803,29 @@ syncAdminEvent = function(text)
     local lowered = lower(cleaned)
     if not (lowered:find("admin event", 1, true) or lowered:find("administrator event", 1, true)) then return end
     local identity = lower(cleaned:gsub("%d%d?:%d%d:?%d*", ""))
-    if Runtime.FeatureState.adminEvents[identity] == cleaned then return end
+    Runtime.FeatureState.adminSeenAt[identity] = os.clock()
+    if Runtime.FeatureState.adminEvents[identity] then return end
     Runtime.FeatureState.adminEvents[identity] = cleaned
     Runtime.EmitEvent({ name = "Administrator Event", state = cleaned, featureEnabled = true })
+end
+
+local function installFeatureStateTracker()
+    task.spawn(function()
+        while Runtime.Running do
+            local now = os.clock()
+            for identity, lastSeen in pairs(Runtime.FeatureState.adminSeenAt) do
+                if now - lastSeen > 8 then
+                    local prior = Runtime.FeatureState.adminEvents[identity]
+                    Runtime.FeatureState.adminSeenAt[identity] = nil
+                    Runtime.FeatureState.adminEvents[identity] = nil
+                    if prior and Config.AdminEventNotifications then
+                        Runtime.EmitEvent({ name = "Administrator Event Ended", state = safeText(prior, 300), featureEnabled = true })
+                    end
+                end
+            end
+            task.wait(3)
+        end
+    end)
 end
 
 local function installChatWatcher()
@@ -860,7 +881,12 @@ local function installCatchRemoteWatcher()
         record = type(record) == "table" and record or {}
         local direct = parseCatchText("You caught " .. name) or {}
         local tierRarity = ({ "Common", "Uncommon", "Rare", "Epic", "Legendary", "Mythical", "Secret", "Forgotten" })[tonumber(record.Tier or record.tier) or 0]
-        direct.player = LocalPlayer and LocalPlayer.Name or "Unknown"
+        local packetPlayer = record.Username or record.username or record.PlayerName or record.playerName
+            or record.DisplayName or record.displayName
+        if not packetPlayer and typeof(record.Player or record.player) == "Instance" then
+            packetPlayer = (record.Player or record.player).Name
+        end
+        direct.player = packetPlayer or (LocalPlayer and LocalPlayer.Name) or "Unknown"
         direct.fish = direct.fish or normalizeSpace(name)
         direct.weight = record.Weight or record.weight or record.WeightKg or record.weightKg or direct.weight or "Unknown"
         direct.mutation = record.Mutation or record.mutation or direct.mutation or "None"
@@ -879,6 +905,7 @@ local function installCatchRemoteWatcher()
         })
         local global = record.Global == true or record.global == true or record.IsGlobal == true or record.isGlobal == true
             or lower(source):find("global", 1, true) ~= nil
+            or (LocalPlayer and lower(direct.player) ~= lower(LocalPlayer.Name))
         return global and Runtime.EmitGlobalCatch(direct) or Runtime.EmitCatch(direct)
     end
     local function inspectArguments(...)
@@ -1578,6 +1605,7 @@ installVisibleTextWatcher()
 installFishDatabaseWatcher()
 installCatchRemoteWatcher()
 installAfkTracker()
+installFeatureStateTracker()
 
 for index, adapter in ipairs(type(Config.Adapters) == "table" and Config.Adapters or {}) do
     if type(adapter) == "function" then
