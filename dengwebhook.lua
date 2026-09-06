@@ -2,12 +2,13 @@
 -- Clean-room replacement based on static behavioral recovery.
 -- No hidden webhooks, license checks, remote code loading, or embedded credentials.
 
-local VERSION = "2.1.0"
+local VERSION = "2.2.0"
 
 local Config = {
     MainWebhook = "",
     PlayerWebhook = "",
     EventWebhook = "",
+    GlobalWebhook = "",
 
     BotName = "DENG",
     BotAvatar = "",
@@ -20,6 +21,7 @@ local Config = {
     TimezoneOffsetSeconds = 7 * 60 * 60,
 
     CatchNotifications = true,
+    GlobalCatchNotifications = true,
     PlayerNotifications = false,
     EventNotifications = false,
     AfkNotifications = false,
@@ -87,7 +89,8 @@ local Runtime = {
     SeenText = setmetatable({}, { __mode = "k" }),
     Status = "Starting",
     Gui = nil,
-    Stats = { catches = 0, players = 0, events = 0, crystals = 0, afk = 0, filtered = 0 },
+    Stats = { catches = 0, globalCatches = 0, players = 0, events = 0, crystals = 0, afk = 0, filtered = 0 },
+    FeatureState = { serverLuck = nil, adminEvents = {} },
     LastInputAt = os.clock(),
     AfkSent = false,
 }
@@ -505,6 +508,10 @@ function Runtime.EmitCatch(data)
     data.weight = safeText(data.weight or "Unknown", 50)
     data.mutation = safeText(data.mutation or "None", 100)
     data.rarity = normalizeRarity(data.rarity)
+    if lower(data.fish):find("shark", 1, true)
+        and (lower(data.mutation):find("color burn", 1, true) or lower(data.mutation):find("colour burn", 1, true)) then
+        data.rarity = "Custom"
+    end
     if not catchAllowed(data) then
         Runtime.Stats.filtered = Runtime.Stats.filtered + 1
         return false, "Catch filtered"
@@ -572,6 +579,54 @@ function Runtime.EmitCatch(data)
     return true
 end
 
+local function isColorBurnShark(data)
+    local fish = lower(normalizeSpace(data and data.fish))
+    local mutation = lower(normalizeSpace(data and data.mutation))
+    return fish:find("shark", 1, true) ~= nil
+        and (mutation:find("color burn", 1, true) ~= nil or mutation:find("colour burn", 1, true) ~= nil)
+end
+
+function Runtime.EmitGlobalCatch(data)
+    if not Config.GlobalCatchNotifications or type(data) ~= "table" then
+        return false, "Global catch notifications disabled"
+    end
+    data.player = safeText(data.player or "Unknown", 100)
+    data.fish = safeText(data.fish or "Unknown fish", 150)
+    data.weight = safeText(data.weight or "Unknown", 50)
+    data.mutation = safeText(data.mutation or "None", 100)
+    data.rarity = normalizeRarity(data.rarity)
+    if isColorBurnShark(data) then data.rarity = "Custom" end
+    if duplicateKey({ "global", data.player, data.fish, data.weight, data.mutation }) then
+        return false, "Duplicate global catch"
+    end
+    local fishRecord = Runtime.FindFish and Runtime.FindFish(data.fish) or nil
+    local thumbnail = assetThumbnail(data.thumbnail or data.image or (fishRecord and fishRecord.thumbnail) or "")
+        or assetThumbnail(Config.DefaultFishThumbnail) or Config.DefaultFishThumbnail
+    local variables = {
+        player = data.player, fish = data.fish, weight = data.weight, mutation = data.mutation,
+        rarity = data.rarity, location = data.location or "Unknown", date = jakartaDate(), version = VERSION,
+    }
+    local target = trim(Config.GlobalWebhook) ~= "" and Config.GlobalWebhook or Config.MainWebhook
+    queueSend(target, {
+        username = safeText(Config.BotName, 80), avatar_url = trim(Config.BotAvatar), content = buildMentionText(),
+        allowed_mentions = { parse = Config.AllowEveryoneMention and { "everyone" } or {}, users = normalizeSnowflakeList(Config.MentionUserIds), roles = normalizeSnowflakeList(Config.MentionRoleIds) },
+        embeds = {{
+            title = applyTemplate("Global {rarity} Catch", variables),
+            description = applyTemplate("**{player}** caught **{fish}**.", variables),
+            color = colorForRarity(data.rarity),
+            fields = {
+                { name = "Weight", value = data.weight == "Unknown" and data.weight or data.weight .. " kg", inline = true },
+                { name = "Mutation", value = data.mutation, inline = true },
+                { name = "Location", value = safeText(data.location or "Unknown", 120), inline = true },
+            },
+            image = { url = thumbnail }, timestamp = timestampIso(),
+            footer = { text = applyTemplate(Config.FooterTemplate, variables) },
+        }},
+    }, "global catch notification")
+    Runtime.Stats.globalCatches = Runtime.Stats.globalCatches + 1
+    return true
+end
+
 function Runtime.EmitPlayer(data)
     if not Config.PlayerNotifications or type(data) ~= "table" then
         return false, "Player notifications disabled"
@@ -600,7 +655,7 @@ function Runtime.EmitPlayer(data)
 end
 
 function Runtime.EmitEvent(data)
-    if not Config.EventNotifications or type(data) ~= "table" then
+    if type(data) ~= "table" or (not Config.EventNotifications and not data.featureEnabled) then
         return false, "Event notifications disabled"
     end
     local name = safeText(data.name or "Unknown event", 150)
@@ -703,17 +758,53 @@ local function processPossibleCatch(text)
     end
 end
 
+local syncServerLuck, syncAdminEvent
+
 local function processPossibleFeature(text)
     text = stripRichText(text)
-    processPossibleCatch(text)
     local lowered = lower(text)
+    local catch = parseCatchText(text)
+    local isGlobal = lowered:find("global", 1, true) and lowered:find("caught", 1, true)
+    if catch then
+        if isGlobal then Runtime.EmitGlobalCatch(catch) else Runtime.EmitCatch(catch) end
+    end
     if Config.CrystalNotifications and (lowered:find("crystal", 1, true) or lowered:find("gemstone", 1, true)) then
         Runtime.EmitCrystal({ name = "Crystal Update", detail = text })
-    elseif Config.ServerLuckNotifications and lowered:find("server luck", 1, true) then
-        Runtime.EmitEvent({ name = "Server Luck", state = text })
-    elseif Config.AdminEventNotifications and (lowered:find("admin event", 1, true) or lowered:find("administrator event", 1, true)) then
-        Runtime.EmitEvent({ name = "Administrator Event", state = text })
+    elseif lowered:find("server luck", 1, true) then
+        syncServerLuck(text)
+    elseif lowered:find("admin event", 1, true) or lowered:find("administrator event", 1, true) then
+        syncAdminEvent(text)
     end
+end
+
+local function parseServerLuck(text)
+    local cleaned = normalizeSpace(stripRichText(text))
+    local lowered = lower(cleaned)
+    if not lowered:find("server luck", 1, true) then return nil end
+    local multiplier = cleaned:match("[Ss]erver%s+[Ll]uck%s*[:%-]?%s*[xX]?([%d%.]+)")
+    local timer = cleaned:match("(%d%d?:%d%d:%d%d)") or cleaned:match("(%d%d?:%d%d)")
+    return { multiplier = multiplier or "Default", timer = timer or "Unknown", raw = cleaned }
+end
+
+syncServerLuck = function(text)
+    if not Config.ServerLuckNotifications then return end
+    local info = parseServerLuck(text)
+    if not info then return end
+    local identity = info.multiplier .. "|" .. info.timer
+    if Runtime.FeatureState.serverLuck == identity then return end
+    Runtime.FeatureState.serverLuck = identity
+    Runtime.EmitEvent({ name = "Server Luck x" .. info.multiplier, state = info.timer == "Unknown" and "active" or info.timer, featureEnabled = true })
+end
+
+syncAdminEvent = function(text)
+    if not Config.AdminEventNotifications then return end
+    local cleaned = normalizeSpace(stripRichText(text))
+    local lowered = lower(cleaned)
+    if not (lowered:find("admin event", 1, true) or lowered:find("administrator event", 1, true)) then return end
+    local identity = lower(cleaned:gsub("%d%d?:%d%d:?%d*", ""))
+    if Runtime.FeatureState.adminEvents[identity] == cleaned then return end
+    Runtime.FeatureState.adminEvents[identity] = cleaned
+    Runtime.EmitEvent({ name = "Administrator Event", state = cleaned, featureEnabled = true })
 end
 
 local function installChatWatcher()
@@ -786,7 +877,9 @@ local function installCatchRemoteWatcher()
             location = direct.location,
             value = record.Value or record.value or record.Price or record.price,
         })
-        return Runtime.EmitCatch(direct)
+        local global = record.Global == true or record.global == true or record.IsGlobal == true or record.isGlobal == true
+            or lower(source):find("global", 1, true) ~= nil
+        return global and Runtime.EmitGlobalCatch(direct) or Runtime.EmitCatch(direct)
     end
     local function inspectArguments(...)
         local values = { ... }
@@ -807,7 +900,10 @@ local function installCatchRemoteWatcher()
         for _, value in ipairs(values) do
             if type(value) == "string" then
                 local parsed = parseCatchText(value)
-                if parsed then Runtime.EmitCatch(parsed); return end
+                if parsed then
+                    if lower(value):find("global", 1, true) then Runtime.EmitGlobalCatch(parsed) else Runtime.EmitCatch(parsed) end
+                    return
+                end
             end
         end
     end
@@ -895,6 +991,7 @@ local function saveConfig()
         MainWebhook = Config.MainWebhook,
         PlayerWebhook = Config.PlayerWebhook,
         EventWebhook = Config.EventWebhook,
+        GlobalWebhook = Config.GlobalWebhook,
         BotName = Config.BotName,
         BotAvatar = Config.BotAvatar,
         EmbedLayout = Config.EmbedLayout,
@@ -904,6 +1001,7 @@ local function saveConfig()
         NotificationPrefix = Config.NotificationPrefix,
         DefaultFishThumbnail = Config.DefaultFishThumbnail,
         CatchNotifications = Config.CatchNotifications,
+        GlobalCatchNotifications = Config.GlobalCatchNotifications,
         PlayerNotifications = Config.PlayerNotifications,
         EventNotifications = Config.EventNotifications,
         AfkNotifications = Config.AfkNotifications,
@@ -944,11 +1042,11 @@ local function loadConfig()
         return false, "Saved configuration is invalid"
     end
     local allowedKeys = {
-        MainWebhook = "string", PlayerWebhook = "string", EventWebhook = "string",
+        MainWebhook = "string", PlayerWebhook = "string", EventWebhook = "string", GlobalWebhook = "string",
         BotName = "string", BotAvatar = "string", EmbedLayout = "number",
         CatchTitleTemplate = "string", CatchDescriptionTemplate = "string",
         FooterTemplate = "string", NotificationPrefix = "string", DefaultFishThumbnail = "string",
-        CatchNotifications = "boolean",
+        CatchNotifications = "boolean", GlobalCatchNotifications = "boolean",
         PlayerNotifications = "boolean", EventNotifications = "boolean",
         AfkNotifications = "boolean", CrystalNotifications = "boolean",
         ServerLuckNotifications = "boolean", AdminEventNotifications = "boolean",
@@ -1365,9 +1463,9 @@ local function createGui()
     local overviewCard = card(overview, "Runtime status")
     local overviewText = textLabel(overviewCard, "", 12, palette.muted, false); overviewText.Size = UDim2.new(1, 0, 0, 90)
     local function refreshOverview()
-        overviewText.Text = string.format("Player: %s\nPlayers in server: %d   •   Queue: %d\nSent: %d catches, %d player, %d event, %d crystal, %d AFK\nFiltered catches: %d",
+        overviewText.Text = string.format("Player: %s\nPlayers in server: %d   •   Queue: %d\nSent: %d catches, %d global, %d player, %d event, %d crystal, %d AFK\nFiltered catches: %d",
             LocalPlayer and LocalPlayer.Name or "Unavailable", #Players:GetPlayers(), #Runtime.Queue,
-            Runtime.Stats.catches, Runtime.Stats.players, Runtime.Stats.events, Runtime.Stats.crystals, Runtime.Stats.afk, Runtime.Stats.filtered)
+            Runtime.Stats.catches, Runtime.Stats.globalCatches, Runtime.Stats.players, Runtime.Stats.events, Runtime.Stats.crystals, Runtime.Stats.afk, Runtime.Stats.filtered)
     end
     refreshOverview(); button(overview, "Refresh dashboard", refreshOverview)
     local safety = card(overview, "Safety profile")
@@ -1377,6 +1475,7 @@ local function createGui()
     webhookInput(webhooks, "Main webhook", "MainWebhook")
     webhookInput(webhooks, "Player webhook", "PlayerWebhook")
     webhookInput(webhooks, "Event webhook", "EventWebhook")
+    webhookInput(webhooks, "Global catch webhook", "GlobalWebhook")
     input(webhooks, "Webhook display name", Config.BotName, function(value, field) Config.BotName = safeText(value, 80); field.Text = Config.BotName end)
     input(webhooks, "Webhook avatar URL", Config.BotAvatar, function(value, field) Config.BotAvatar = trim(value); field.Text = Config.BotAvatar end)
     button(webhooks, "Send test notification", Runtime.TestWebhook)
@@ -1384,6 +1483,7 @@ local function createGui()
     local catches = newPage("Catches", "Catch parser, rarity routing, custom fish, mutations, and source watchers.")
     local sourceCard = card(catches, "Detection sources")
     toggle(sourceCard, "Catch notifications", function() return Config.CatchNotifications end, function(v) Config.CatchNotifications = v end)
+    toggle(sourceCard, "Global catch notifications", function() return Config.GlobalCatchNotifications end, function(v) Config.GlobalCatchNotifications = v end)
     toggle(sourceCard, "Watch chat messages", function() return Config.WatchChat end, function(v) Config.WatchChat = v end)
     toggle(sourceCard, "Watch visible game text", function() return Config.WatchVisibleText end, function(v) Config.WatchVisibleText = v end)
     local rarityCard = card(catches, "Rarity filters")
