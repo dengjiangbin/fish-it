@@ -2,9 +2,10 @@
 -- Clean-room replacement based on static behavioral recovery.
 -- No hidden webhooks, license checks, remote code loading, or embedded credentials.
 
-local VERSION = "2.2.1"
+local VERSION = "2.3.0"
 
 local Config = {
+    SchemaVersion = 2,
     MainWebhook = "",
     PlayerWebhook = "",
     EventWebhook = "",
@@ -28,8 +29,8 @@ local Config = {
     CrystalNotifications = false,
     ServerLuckNotifications = false,
     AdminEventNotifications = false,
-    WatchChat = true,
-    WatchVisibleText = true,
+    WatchChat = false,
+    WatchVisibleText = false,
 
     MinimumRarity = "Common",
     EnabledRarities = {
@@ -908,19 +909,26 @@ local function installCatchRemoteWatcher()
             or (LocalPlayer and lower(direct.player) ~= lower(LocalPlayer.Name))
         return global and Runtime.EmitGlobalCatch(direct) or Runtime.EmitCatch(direct)
     end
-    local function inspectArguments(...)
+    local function inspectArguments(remoteName, ...)
         local values = { ... }
-        -- Fish It catch packets observed by the recovered pipeline commonly use
-        -- (..., itemName, { Weight = value, ... }). Prefer that typed shape.
-        for index, value in ipairs(values) do
+        -- Recovered Fish It handler signature: (playerKey, context, itemName, data),
+        -- where itemName is a string and data is a table containing Weight.
+        local itemName, packet = values[3], values[4]
+        if type(itemName) == "string" and type(packet) == "table"
+            and (packet.Weight ~= nil or packet.weight ~= nil) then
+            emitRecord(itemName, packet, "catch_packet")
+            return
+        end
+
+        -- Only catch/fish/reward-named remotes may use alternate packet layouts.
+        local likelyCatchRemote = remoteName:find("catch", 1, true)
+            or remoteName:find("fish", 1, true) or remoteName:find("reward", 1, true)
+        if not likelyCatchRemote then return end
+        for _, value in ipairs(values) do
             if type(value) == "table" then
                 local name = value.FishName or value.fishName or value.ItemName or value.itemName or value.DisplayName or value.displayName or value.Name or value.name
-                if type(name) == "string" and (value.Weight ~= nil or value.weight ~= nil or value.Rarity ~= nil or value.rarity ~= nil) then
+                if type(name) == "string" and (value.Weight ~= nil or value.weight ~= nil) then
                     if emitRecord(name, value, "remote_record") then return end
-                end
-                local previous = values[index - 1]
-                if type(previous) == "string" and (value.Weight ~= nil or value.weight ~= nil) then
-                    if emitRecord(previous, value, "remote_packet") then return end
                 end
             end
         end
@@ -941,7 +949,7 @@ local function installCatchRemoteWatcher()
         hooked[object] = true
         local ok, connection = pcall(function()
             return object.OnClientEvent:Connect(function(...)
-                if Runtime.Running then pcall(inspectArguments, ...) end
+                if Runtime.Running then pcall(inspectArguments, name, ...) end
             end)
         end)
         if ok and connection then trackConnection(connection) end
@@ -1015,6 +1023,7 @@ local function saveConfig()
         return false, "File persistence is unavailable"
     end
     local export = {
+        SchemaVersion = Config.SchemaVersion,
         MainWebhook = Config.MainWebhook,
         PlayerWebhook = Config.PlayerWebhook,
         EventWebhook = Config.EventWebhook,
@@ -1069,6 +1078,7 @@ local function loadConfig()
         return false, "Saved configuration is invalid"
     end
     local allowedKeys = {
+        SchemaVersion = "number",
         MainWebhook = "string", PlayerWebhook = "string", EventWebhook = "string", GlobalWebhook = "string",
         BotName = "string", BotAvatar = "string", EmbedLayout = "number",
         CatchTitleTemplate = "string", CatchDescriptionTemplate = "string",
@@ -1086,6 +1096,13 @@ local function loadConfig()
         if allowedKeys[key] == type(value) then
             Config[key] = value
         end
+    end
+    -- v2.3 replaces the noisy legacy broad text sources with the recovered
+    -- typed catch packet. Old saved configs did not have a schema marker.
+    if decoded.SchemaVersion == nil then
+        Config.WatchChat = false
+        Config.WatchVisibleText = false
+        Config.SchemaVersion = 2
     end
     Config.MentionUserIds = normalizeSnowflakeList(Config.MentionUserIds)
     Config.MentionRoleIds = normalizeSnowflakeList(Config.MentionRoleIds)
