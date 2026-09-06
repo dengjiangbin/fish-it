@@ -2,7 +2,7 @@
 -- DENG-branded Fish It notification dashboard.
 -- Reconstructed from the recovered feature map.
 
-local VERSION = "3.0.0"
+local VERSION = "3.1.0"
 
 local Config = {
     SchemaVersion = 3,
@@ -36,6 +36,8 @@ local Config = {
     AntiAfkEnabled = true,
     WatchChat = false,
     WatchVisibleText = false,
+    EnableReplionAdapter = true,
+    ReplionPollSeconds = 1,
 
     MinimumRarity = "Common",
     EnabledRarities = {
@@ -97,6 +99,7 @@ local Runtime = {
     Gui = nil,
     Stats = { catches = 0, globalCatches = 0, players = 0, events = 0, crystals = 0, afk = 0, filtered = 0 },
     FeatureState = { serverLuck = nil, serverLuckTimer = nil, adminEvents = {}, adminSeenAt = {} },
+    DataSource = { replion = "starting", inventoryCount = 0, lastError = nil },
     EventCatalog = {},
     LastInputAt = os.clock(),
     AfkSent = false,
@@ -879,6 +882,20 @@ function Runtime.GetLocationContext()
     return { placeId = game.PlaceId, jobId = safeText(game.JobId, 100), playerCount = #Players:GetPlayers() }
 end
 
+function Runtime.GetDiagnostics()
+    return {
+        version = VERSION,
+        running = Runtime.Running,
+        status = Runtime.Status,
+        http = Request and "executor" or "roblox_fallback",
+        replion = Runtime.DataSource.replion,
+        inventoryCount = Runtime.DataSource.inventoryCount,
+        dataSourceError = Runtime.DataSource.lastError,
+        queued = #Runtime.Queue,
+        stats = Runtime.Stats,
+    }
+end
+
 local function processPossibleCatch(text)
     local data = parseCatchText(text)
     if data then
@@ -1157,6 +1174,188 @@ local function installCatchRemoteWatcher()
     trackConnection(ReplicatedStorage.DescendantAdded:Connect(hook))
 end
 
+-- Fish It keeps the local player's owned inventory in the replicated "Data"
+-- Replion.  This is a more dependable catch source than guessing remote names.
+-- The adapter is read-only: it baselines the current inventory and only emits
+-- entries that appear (or whose stack quantity increases) after startup.
+local function installReplionInventoryAdapter()
+    if not Config.EnableReplionAdapter then
+        Runtime.DataSource.replion = "disabled"
+        return
+    end
+
+    task.spawn(function()
+        local function fail(reason)
+            Runtime.DataSource.replion = "fallback"
+            Runtime.DataSource.lastError = reason
+        end
+
+        local packages = ReplicatedStorage:FindFirstChild("Packages")
+            or ReplicatedStorage:WaitForChild("Packages", 20)
+        local replionModule = packages and packages:FindFirstChild("Replion")
+        if not replionModule or not replionModule:IsA("ModuleScript") then
+            fail("Packages.Replion was not found")
+            return
+        end
+
+        local okReplion, Replion = pcall(require, replionModule)
+        local client = okReplion and type(Replion) == "table" and Replion.Client or nil
+        if type(client) ~= "table" then
+            fail("Replion.Client is unavailable")
+            return
+        end
+
+        local dataReplion
+        local okData = pcall(function()
+            if type(client.GetReplion) == "function" then
+                dataReplion = client:GetReplion("Data")
+            end
+            if not dataReplion and type(client.WaitReplion) == "function" then
+                dataReplion = client:WaitReplion("Data")
+            end
+        end)
+        if not okData or type(dataReplion) ~= "table" then
+            fail("Data Replion was not replicated")
+            return
+        end
+
+        local shared = ReplicatedStorage:FindFirstChild("Shared")
+            or ReplicatedStorage:WaitForChild("Shared", 10)
+        local utilityModule = shared and shared:FindFirstChild("ItemUtility")
+        local ItemUtility
+        if utilityModule and utilityModule:IsA("ModuleScript") then
+            local okUtility, result = pcall(require, utilityModule)
+            if okUtility and type(result) == "table" then ItemUtility = result end
+        end
+
+        local tierNames = { "Common", "Uncommon", "Rare", "Epic", "Legendary", "Mythical", "Secret", "Forgotten" }
+        local baseline = {}
+        local baselineReady = false
+        local announcedActive = false
+
+        local function readInventory()
+            local inventory
+            pcall(function()
+                if type(dataReplion.GetExpect) == "function" then
+                    inventory = dataReplion:GetExpect({ "Inventory", "Items" })
+                elseif type(dataReplion.Get) == "function" then
+                    inventory = dataReplion:Get({ "Inventory", "Items" })
+                end
+            end)
+            return type(inventory) == "table" and inventory or nil
+        end
+
+        local function scalarFrom(record, wanted, depth, seen)
+            if type(record) ~= "table" or depth > 4 then return nil end
+            seen = seen or {}
+            if seen[record] then return nil end
+            seen[record] = true
+            for key, value in pairs(record) do
+                if wanted[lower(key)] and (type(value) == "string" or type(value) == "number" or type(value) == "boolean") then
+                    return value
+                end
+            end
+            for _, value in pairs(record) do
+                if type(value) == "table" then
+                    local found = scalarFrom(value, wanted, depth + 1, seen)
+                    if found ~= nil then return found end
+                end
+            end
+            return nil
+        end
+
+        local function resolveEntry(item)
+            local itemId = tonumber(item.Id or item.ID or item.id) or item.Id or item.ID or item.id
+            if itemId == nil then return nil end
+            local definition
+            if ItemUtility and type(ItemUtility.GetItemDataFromItemType) == "function" then
+                local ok, result = pcall(ItemUtility.GetItemDataFromItemType, "Items", itemId)
+                if ok and type(result) == "table" then
+                    definition = type(result.Data) == "table" and result.Data or result
+                end
+            end
+            if type(definition) ~= "table" or definition.Type ~= "Fish" or trim(definition.Name) == "" then
+                return nil
+            end
+
+            local metadata = type(item.Metadata) == "table" and item.Metadata or item
+            local weight = scalarFrom(metadata, { weight=true, weightkg=true, kg=true, mass=true }, 0)
+            local mutation = scalarFrom(metadata, {
+                mutation=true, mutationname=true, variant=true, variantname=true, variantid=true,
+            }, 0)
+            if mutation ~= nil and tostring(mutation):match("^%d+$") then mutation = nil end
+            local rarity = scalarFrom(metadata, { rarity=true, tiername=true }, 0)
+                or tierNames[tonumber(definition.Tier) or 0] or "Common"
+            local thumbnail = definition.Image or definition.ImageId or definition.Icon or definition.IconId
+                or definition.Thumbnail or definition.Texture or definition.AssetId
+            local location = definition.Location or definition.Zone or definition.Map
+            local chance = definition.Chance or definition.Probability or definition.Odds
+            local quantity = math.max(1, tonumber(item.Quantity or item.Amount or item.Count) or 1)
+            return {
+                player = LocalPlayer and LocalPlayer.Name or "Unknown",
+                fish = tostring(definition.Name), weight = weight or "Unknown",
+                mutation = mutation and tostring(mutation) or "None", rarity = tostring(rarity),
+                thumbnail = thumbnail, location = location, chance = chance,
+                itemId = tostring(itemId), quantity = quantity,
+            }
+        end
+
+        local function scan()
+            local inventory = readInventory()
+            if not inventory then
+                fail("Inventory.Items is unavailable")
+                return false
+            end
+            local nextBaseline, count = {}, 0
+            for key, item in pairs(inventory) do
+                if type(item) == "table" then
+                    count = count + 1
+                    local identity = tostring(item.UUID or item.Uuid or item.uuid or key)
+                    local quantity = math.max(1, tonumber(item.Quantity or item.Amount or item.Count) or 1)
+                    nextBaseline[identity] = quantity
+                    if baselineReady then
+                        local previous = baseline[identity]
+                        if previous == nil or quantity > previous then
+                            local catch = resolveEntry(item)
+                            if catch then
+                                Runtime.RegisterFish({
+                                    name = catch.fish, rarity = catch.rarity, thumbnail = catch.thumbnail,
+                                    location = catch.location, chance = catch.chance,
+                                })
+                                Runtime.EmitCatch(catch)
+                            end
+                        end
+                    else
+                        local fish = resolveEntry(item)
+                        if fish then
+                            Runtime.RegisterFish({
+                                name = fish.fish, rarity = fish.rarity, thumbnail = fish.thumbnail,
+                                location = fish.location, chance = fish.chance,
+                            })
+                        end
+                    end
+                end
+            end
+            baseline = nextBaseline
+            baselineReady = true
+            Runtime.DataSource.replion = "active"
+            Runtime.DataSource.inventoryCount = count
+            Runtime.DataSource.lastError = nil
+            if not announcedActive then
+                announcedActive = true
+                setStatus("Ready — Fish It inventory connected (" .. tostring(count) .. " items)")
+            end
+            return true
+        end
+
+        scan()
+        while Runtime.Running do
+            task.wait(clampNumber(Config.ReplionPollSeconds, 0.5, 10, 1))
+            scan()
+        end
+    end)
+end
+
 local function readAttribute(object, names)
     for _, name in ipairs(names) do
         local ok, value = pcall(function() return object:GetAttribute(name) end)
@@ -1265,6 +1464,8 @@ local function saveConfig()
         AntiAfkEnabled = Config.AntiAfkEnabled,
         WatchChat = Config.WatchChat,
         WatchVisibleText = Config.WatchVisibleText,
+        EnableReplionAdapter = Config.EnableReplionAdapter,
+        ReplionPollSeconds = Config.ReplionPollSeconds,
         EnabledRarities = Config.EnabledRarities,
         CustomFishNames = Config.CustomFishNames,
         CustomMutations = Config.CustomMutations,
@@ -1308,7 +1509,8 @@ local function loadConfig()
         AfkNotifications = "boolean", CrystalNotifications = "boolean",
         ServerLuckNotifications = "boolean", AdminEventNotifications = "boolean",
         ElementalBalancerNotifications = "boolean", AntiAfkEnabled = "boolean",
-        WatchChat = "boolean", WatchVisibleText = "boolean", EnabledRarities = "table",
+        WatchChat = "boolean", WatchVisibleText = "boolean", EnableReplionAdapter = "boolean",
+        ReplionPollSeconds = "number", EnabledRarities = "table",
         CustomFishNames = "table", CustomMutations = "table",
         MentionUserIds = "table", MentionRoleIds = "table",
         AllowEveryoneMention = "boolean", AfkThresholdSeconds = "number",
@@ -1851,6 +2053,7 @@ installChatWatcher()
 installPlayerWatcher()
 installVisibleTextWatcher()
 installFishDatabaseWatcher()
+installReplionInventoryAdapter()
 installCatchRemoteWatcher()
 installAfkTracker()
 installFeatureStateTracker()
