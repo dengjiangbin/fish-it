@@ -148,18 +148,25 @@ local function validateWebhook(url)
 end
 
 local function getRequestFunction()
-    local candidates = {
-        rawget(_G, "request"),
-        rawget(_G, "http_request"),
-        rawget(_G, "httprequest"),
-    }
-    local synTable = rawget(_G, "syn")
-    if type(synTable) == "table" then
-        table.insert(candidates, synTable.request)
+    local environments = { _G }
+    if type(getgenv) == "function" then
+        local ok, environment = pcall(getgenv)
+        if ok and type(environment) == "table" and environment ~= _G then
+            table.insert(environments, environment)
+        end
     end
-    local fluxusTable = rawget(_G, "fluxus")
-    if type(fluxusTable) == "table" then
-        table.insert(candidates, fluxusTable.request)
+
+    local candidates = {}
+    for _, environment in ipairs(environments) do
+        table.insert(candidates, rawget(environment, "request"))
+        table.insert(candidates, rawget(environment, "http_request"))
+        table.insert(candidates, rawget(environment, "httprequest"))
+        for _, namespace in ipairs({ "syn", "fluxus", "http", "krnl" }) do
+            local requestTable = rawget(environment, namespace)
+            if type(requestTable) == "table" then
+                table.insert(candidates, requestTable.request)
+            end
+        end
     end
     for _, candidate in ipairs(candidates) do
         if type(candidate) == "function" then
@@ -170,6 +177,47 @@ local function getRequestFunction()
 end
 
 local Request = getRequestFunction()
+
+local function performRequest(options)
+    local errors = {}
+
+    if Request then
+        local ok, response = pcall(Request, options)
+        if ok and response then
+            return response
+        end
+        table.insert(errors, "executor request failed")
+    end
+
+    local requestOptions = {
+        Url = options.Url,
+        Method = options.Method,
+        Headers = options.Headers,
+        Body = options.Body,
+    }
+    local requestOk, requestResponse = pcall(function()
+        return HttpService:RequestAsync(requestOptions)
+    end)
+    if requestOk and requestResponse then
+        return requestResponse
+    end
+    table.insert(errors, "RequestAsync unavailable")
+
+    local postOk, postResponse = pcall(function()
+        return HttpService:PostAsync(
+            options.Url,
+            options.Body,
+            Enum.HttpContentType.ApplicationJson,
+            false
+        )
+    end)
+    if postOk then
+        return { StatusCode = 204, Body = postResponse, Success = true }
+    end
+    table.insert(errors, "PostAsync unavailable")
+
+    return nil, table.concat(errors, "; ")
+end
 
 local function setStatus(message)
     Runtime.Status = safeText(message, 180)
@@ -194,9 +242,6 @@ local function jsonEncode(value)
 end
 
 local function webhookPost(url, payload)
-    if not Request then
-        return false, "No supported HTTP request function is available"
-    end
     local normalized, validationError = validateWebhook(url)
     if not normalized then
         return false, validationError
@@ -205,17 +250,17 @@ local function webhookPost(url, payload)
     if not body then
         return false, encodingError
     end
-    local ok, response = pcall(Request, {
+    local response, requestError = performRequest({
         Url = normalized,
         Method = "POST",
         Headers = { ["Content-Type"] = "application/json" },
         Body = body,
         Timeout = clampNumber(Config.RequestTimeoutSeconds, 5, 30, 15),
     })
-    if not ok then
-        return false, "Request failed before receiving a response"
+    if not response then
+        return false, "HTTP POST unavailable: " .. tostring(requestError)
     end
-    local statusCode = tonumber(response and (response.StatusCode or response.Status)) or 0
+    local statusCode = tonumber(response.StatusCode or response.Status or response.status_code) or 0
     if statusCode >= 200 and statusCode < 300 then
         return true
     end
@@ -853,6 +898,6 @@ if not guiOk then
     warn("DENGFishWebhook UI could not be created; runtime API remains available")
 end
 
-setStatus(Request and "Ready — configure your webhook" or "Ready, but this executor has no HTTP request function")
+setStatus(Request and "Ready — executor HTTP detected" or "Ready — using Roblox HTTP fallback")
 
 return Runtime
