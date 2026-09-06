@@ -2,7 +2,7 @@
 -- DENG-branded Fish It notification dashboard.
 -- Reconstructed from the recovered feature map.
 
-local VERSION = "2.4.0"
+local VERSION = "3.0.0"
 
 local Config = {
     SchemaVersion = 3,
@@ -10,6 +10,9 @@ local Config = {
     PlayerWebhook = "",
     EventWebhook = "",
     GlobalWebhook = "",
+    SecretWebhook = "",
+    ForgottenWebhook = "",
+    UnknownWebhook = "",
 
     BotName = "DENG",
     BotAvatar = "",
@@ -29,6 +32,8 @@ local Config = {
     CrystalNotifications = false,
     ServerLuckNotifications = false,
     AdminEventNotifications = false,
+    ElementalBalancerNotifications = false,
+    AntiAfkEnabled = true,
     WatchChat = false,
     WatchVisibleText = false,
 
@@ -92,6 +97,7 @@ local Runtime = {
     Gui = nil,
     Stats = { catches = 0, globalCatches = 0, players = 0, events = 0, crystals = 0, afk = 0, filtered = 0 },
     FeatureState = { serverLuck = nil, serverLuckTimer = nil, adminEvents = {}, adminSeenAt = {} },
+    EventCatalog = {},
     LastInputAt = os.clock(),
     AfkSent = false,
 }
@@ -399,6 +405,10 @@ local function jakartaDate()
     return os.date("!%d %B %Y", os.time() + clampNumber(Config.TimezoneOffsetSeconds, -43200, 50400, 25200))
 end
 
+local function jakartaTimestamp()
+    return os.date("!%d/%m/%Y %H:%M:%S", os.time() + clampNumber(Config.TimezoneOffsetSeconds, -43200, 50400, 25200))
+end
+
 local function applyTemplate(template, variables)
     local output = tostring(template or "")
     output = output:gsub("{([%w_]+)}", function(key)
@@ -522,6 +532,9 @@ function Runtime.EmitCatch(data)
     data.fish = safeText(data.fish or "Unknown fish", 150)
     data.weight = safeText(data.weight or "Unknown", 50)
     data.mutation = safeText(data.mutation or "None", 100)
+    local suppliedRarity = lower(trim(data.rarity))
+    local knownRarities = { common=true, uncommon=true, rare=true, epic=true, legendary=true, legend=true, mythical=true, mythic=true, secret=true, forgotten=true, forgottens=true, custom=true }
+    data.unknownRarity = suppliedRarity ~= "" and not knownRarities[suppliedRarity]
     data.rarity = normalizeRarity(data.rarity)
     if lower(data.fish):find("shark", 1, true)
         and (lower(data.mutation):find("color burn", 1, true) or lower(data.mutation):find("colour burn", 1, true)) then
@@ -598,7 +611,11 @@ function Runtime.EmitCatch(data)
         allowed_mentions = { parse = Config.AllowEveryoneMention and { "everyone" } or {}, users = mentionUsers, roles = mentionRoles },
         embeds = { embed },
     }
-    queueSend(Config.MainWebhook, payload, "catch notification")
+    local target = Config.MainWebhook
+    if data.rarity == "Secret" and trim(Config.SecretWebhook) ~= "" then target = Config.SecretWebhook
+    elseif data.rarity == "Forgotten" and trim(Config.ForgottenWebhook) ~= "" then target = Config.ForgottenWebhook
+    elseif data.unknownRarity and trim(Config.UnknownWebhook) ~= "" then target = Config.UnknownWebhook end
+    queueSend(target, payload, "catch notification")
     Runtime.Stats.catches = Runtime.Stats.catches + 1
     return true
 end
@@ -741,19 +758,49 @@ function Runtime.EmitEvent(data)
     if duplicateKey({ "event", name, state }) then
         return false, "Duplicate event"
     end
+    local started = state ~= "ended" and state ~= "inactive"
+    local detected = safeText(data.detected or jakartaTimestamp(), 40)
+    local eventRecord = Runtime.EventCatalog[lower(name)]
+    local image = assetThumbnail(data.image or data.thumbnail or (eventRecord and eventRecord.image) or "")
     local payload = {
         username = safeText(Config.BotName, 80),
         avatar_url = trim(Config.BotAvatar),
         embeds = {{
-            title = "Event Update",
-            description = "**" .. name .. "** is now **" .. state .. "**.",
-            color = state == "ended" and 0x95A5A6 or 0x9B59B6,
+            title = started and ("EVENT " .. name .. " DIMULAI!") or ("EVENT " .. name .. " BERAKHIR!"),
+            description = started and ("**" .. name .. "** sedang aktif. Segera kembali ke game untuk mengikuti event.")
+                or ("**" .. name .. "** telah berakhir."),
+            color = started and 0xFFD700 or 0x95A5A6,
+            thumbnail = image and { url = image } or nil,
+            fields = {{ name = "Detected", value = "`" .. detected .. "`", inline = false }},
             timestamp = timestampIso(),
         }},
     }
     local target = trim(Config.EventWebhook) ~= "" and Config.EventWebhook or Config.MainWebhook
     queueSend(target, payload, "event notification")
     Runtime.Stats.events = Runtime.Stats.events + 1
+    return true
+end
+
+
+function Runtime.EmitElementalBalancer(data)
+    if not Config.ElementalBalancerNotifications or type(data) ~= "table" then return false, "Elemental Balancer disabled" end
+    local groups, counts = {}, {}
+    for _, key in ipairs({ "Fire", "Frozen", "Storm" }) do
+        local entries = type(data[key] or data[lower(key)]) == "table" and (data[key] or data[lower(key)]) or {}
+        counts[#counts + 1] = tostring(#entries)
+        local lines = { "💞 **" .. key .. " (" .. tostring(#entries) .. " Player):**" }
+        for _, player in ipairs(entries) do table.insert(lines, "• " .. safeText(player, 100)) end
+        groups[#groups + 1] = table.concat(lines, "\n")
+    end
+    local balanced = counts[1] == counts[2] and counts[2] == counts[3]
+    local description = "💞 **Status:** " .. (balanced and "BALANCE" or "UNBALANCE")
+        .. "\n💞 **Formation:** " .. table.concat(counts, "-") .. "\n\n" .. table.concat(groups, "\n\n")
+        .. "\n\nScanned: " .. jakartaTimestamp() .. " WIB"
+    local target = trim(Config.EventWebhook) ~= "" and Config.EventWebhook or Config.MainWebhook
+    queueSend(target, { username = safeText(Config.BotName, 80), avatar_url = trim(Config.BotAvatar), embeds = {{
+        title = "ELEMENTAL BALANCER TRACKING", description = safeMultiline(description, 4000),
+        color = balanced and 0x2ECC71 or 0xE74C3C, timestamp = timestampIso(),
+    }}}, "elemental balancer")
     return true
 end
 
@@ -769,8 +816,10 @@ function Runtime.EmitCrystal(data)
     local target = trim(Config.EventWebhook) ~= "" and Config.EventWebhook or Config.MainWebhook
     queueSend(target, {
         username = safeText(Config.BotName, 80), avatar_url = trim(Config.BotAvatar),
-        embeds = {{ title = name, description = detail, color = 0x42D9C8, timestamp = timestampIso(),
-            footer = { text = "DENG Fish Webhook v" .. VERSION } }},
+        embeds = {{ title = "CRYSTALS SPAWNED!", description = "💞 **" .. detail .. "**",
+            color = 0x55BCEB, thumbnail = assetThumbnail(data.image or data.thumbnail or "") and { url = assetThumbnail(data.image or data.thumbnail or "") } or nil,
+            fields = {{ name = "Detected", value = "`" .. jakartaTimestamp() .. " WIB`", inline = false }},
+            timestamp = timestampIso(), footer = { text = "DENG Fish It" } }},
     }, "crystal notification")
     Runtime.Stats.crystals = Runtime.Stats.crystals + 1
     return true
@@ -905,6 +954,65 @@ local function installFeatureStateTracker()
             task.wait(3)
         end
     end)
+end
+
+local function installTargetedFeatureWatcher()
+    local seen = setmetatable({}, { __mode = "k" })
+    local knownEvents = {
+        "Blizzard Elemental", "Aurora Borealis", "Overlord Hydra Spawn", "Dark Megalodon Hunt",
+    }
+    task.spawn(function()
+        while Runtime.Running do
+            if Config.EventNotifications or Config.CrystalNotifications or Config.ServerLuckNotifications or Config.AdminEventNotifications then
+                local playerGui = LocalPlayer and LocalPlayer:FindFirstChildOfClass("PlayerGui")
+                if playerGui then
+                    for _, object in ipairs(playerGui:GetDescendants()) do
+                        if (object:IsA("TextLabel") or object:IsA("TextButton")) and object.Visible and seen[object] ~= object.Text then
+                            seen[object] = object.Text
+                            local text, lowered = stripRichText(object.Text), lower(stripRichText(object.Text))
+                            if Config.CrystalNotifications and lowered:find("crystal", 1, true) and (lowered:find("spawn", 1, true) or lowered:find("appeared", 1, true)) then
+                                Runtime.EmitCrystal({ detail = "Crystals have spawned in various locations, find them quickly!", image = object:GetAttribute("Image") or object:GetAttribute("Icon") })
+                            end
+                            if Config.ServerLuckNotifications and lowered:find("server luck", 1, true) then syncServerLuck(text) end
+                            if Config.AdminEventNotifications and (lowered:find("admin event", 1, true) or lowered:find("administrator event", 1, true)) then syncAdminEvent(text) end
+                            if Config.EventNotifications then
+                                local matchedEvent = false
+                                for _, eventName in ipairs(knownEvents) do
+                                    if lowered:find(lower(eventName), 1, true) then
+                                        Runtime.EmitEvent({ name = eventName, state = "active", image = object:GetAttribute("Image") or object:GetAttribute("Icon") })
+                                        matchedEvent = true
+                                        break
+                                    end
+                                end
+                                if not matchedEvent then
+                                    for _, eventRecord in pairs(Runtime.EventCatalog) do
+                                        if lowered:find(lower(eventRecord.name), 1, true) then
+                                            Runtime.EmitEvent({ name = eventRecord.name, state = "active", image = eventRecord.image })
+                                            break
+                                        end
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+            task.wait(1)
+        end
+    end)
+end
+
+local function installAntiAfk()
+    if not LocalPlayer then return end
+    local ok, VirtualUser = pcall(function() return game:GetService("VirtualUser") end)
+    if not ok or not VirtualUser then return end
+    trackConnection(LocalPlayer.Idled:Connect(function()
+        if not Runtime.Running or not Config.AntiAfkEnabled then return end
+        pcall(function()
+            VirtualUser:CaptureController()
+            VirtualUser:ClickButton2(Vector2.new(0, 0))
+        end)
+    end))
 end
 
 local function installChatWatcher()
@@ -1079,12 +1187,25 @@ local function registerFishInstance(object)
     })
 end
 
+local function registerEventInstance(object)
+    if not object or object:IsA("RemoteEvent") or object:IsA("RemoteFunction") then return false end
+    local eventName = readAttribute(object, { "EventName", "eventName", "DisplayName", "displayName" })
+    local isEvent = readAttribute(object, { "IsEvent", "isEvent", "Event", "event" })
+    local image = readAttribute(object, { "EventImage", "eventImage", "Thumbnail", "thumbnail", "Image", "image", "Icon", "icon", "AssetId", "assetId" })
+    if not eventName and isEvent ~= true then return false end
+    eventName = safeText(eventName or object.Name, 150)
+    Runtime.EventCatalog[lower(eventName)] = { name = eventName, image = image }
+    return true
+end
+
 local function installFishDatabaseWatcher()
     for _, object in ipairs(ReplicatedStorage:GetDescendants()) do
         pcall(registerFishInstance, object)
+        pcall(registerEventInstance, object)
     end
     trackConnection(ReplicatedStorage.DescendantAdded:Connect(function(object)
         if Runtime.Running then pcall(registerFishInstance, object) end
+        if Runtime.Running then pcall(registerEventInstance, object) end
     end))
 end
 
@@ -1121,6 +1242,9 @@ local function saveConfig()
         PlayerWebhook = Config.PlayerWebhook,
         EventWebhook = Config.EventWebhook,
         GlobalWebhook = Config.GlobalWebhook,
+        SecretWebhook = Config.SecretWebhook,
+        ForgottenWebhook = Config.ForgottenWebhook,
+        UnknownWebhook = Config.UnknownWebhook,
         BotName = Config.BotName,
         BotAvatar = Config.BotAvatar,
         EmbedLayout = Config.EmbedLayout,
@@ -1137,6 +1261,8 @@ local function saveConfig()
         CrystalNotifications = Config.CrystalNotifications,
         ServerLuckNotifications = Config.ServerLuckNotifications,
         AdminEventNotifications = Config.AdminEventNotifications,
+        ElementalBalancerNotifications = Config.ElementalBalancerNotifications,
+        AntiAfkEnabled = Config.AntiAfkEnabled,
         WatchChat = Config.WatchChat,
         WatchVisibleText = Config.WatchVisibleText,
         EnabledRarities = Config.EnabledRarities,
@@ -1173,6 +1299,7 @@ local function loadConfig()
     local allowedKeys = {
         SchemaVersion = "number",
         MainWebhook = "string", PlayerWebhook = "string", EventWebhook = "string", GlobalWebhook = "string",
+        SecretWebhook = "string", ForgottenWebhook = "string", UnknownWebhook = "string",
         BotName = "string", BotAvatar = "string", EmbedLayout = "number",
         CatchTitleTemplate = "string", CatchDescriptionTemplate = "string",
         FooterTemplate = "string", NotificationPrefix = "string", DefaultFishThumbnail = "string",
@@ -1180,6 +1307,7 @@ local function loadConfig()
         PlayerNotifications = "boolean", EventNotifications = "boolean",
         AfkNotifications = "boolean", CrystalNotifications = "boolean",
         ServerLuckNotifications = "boolean", AdminEventNotifications = "boolean",
+        ElementalBalancerNotifications = "boolean", AntiAfkEnabled = "boolean",
         WatchChat = "boolean", WatchVisibleText = "boolean", EnabledRarities = "table",
         CustomFishNames = "table", CustomMutations = "table",
         MentionUserIds = "table", MentionRoleIds = "table",
@@ -1616,6 +1744,9 @@ local function createGui()
     webhookInput(webhooks, "Player webhook", "PlayerWebhook")
     webhookInput(webhooks, "Event webhook", "EventWebhook")
     webhookInput(webhooks, "Global catch webhook", "GlobalWebhook")
+    webhookInput(webhooks, "Secret rarity webhook", "SecretWebhook")
+    webhookInput(webhooks, "Forgotten rarity webhook", "ForgottenWebhook")
+    webhookInput(webhooks, "Unknown rarity webhook", "UnknownWebhook")
     input(webhooks, "Webhook display name", Config.BotName, function(value, field) Config.BotName = safeText(value, 80); field.Text = Config.BotName end)
     input(webhooks, "Webhook avatar URL", Config.BotAvatar, function(value, field) Config.BotAvatar = trim(value); field.Text = Config.BotAvatar end)
     button(webhooks, "Send test notification", Runtime.TestWebhook)
@@ -1647,6 +1778,7 @@ local function createGui()
     local playerCard = card(playersPage, "Player tracking")
     toggle(playerCard, "Join and leave notifications", function() return Config.PlayerNotifications end, function(v) Config.PlayerNotifications = v end)
     toggle(playerCard, "AFK notifications", function() return Config.AfkNotifications end, function(v) Config.AfkNotifications = v end)
+    toggle(playerCard, "Anti AFK", function() return Config.AntiAfkEnabled end, function(v) Config.AntiAfkEnabled = v end)
     input(playersPage, "AFK threshold in seconds", Config.AfkThresholdSeconds, function(value, field) Config.AfkThresholdSeconds = clampNumber(value, 60, 86400, 300); field.Text = tostring(Config.AfkThresholdSeconds) end)
     button(playersPage, "Test player notification", function()
         Runtime.EmitPlayer({ action = "joined", name = LocalPlayer and LocalPlayer.Name or "DENG Test", userId = LocalPlayer and LocalPlayer.UserId or 0 })
@@ -1659,6 +1791,7 @@ local function createGui()
     toggle(eventCard, "General event notifications", function() return Config.EventNotifications end, function(v) Config.EventNotifications = v end)
     toggle(eventCard, "Server luck detection", function() return Config.ServerLuckNotifications end, function(v) Config.ServerLuckNotifications = v; if v then Config.EventNotifications = true end end)
     toggle(eventCard, "Administrator event detection", function() return Config.AdminEventNotifications end, function(v) Config.AdminEventNotifications = v; if v then Config.EventNotifications = true end end)
+    toggle(eventCard, "Elemental Balancer tracking", function() return Config.ElementalBalancerNotifications end, function(v) Config.ElementalBalancerNotifications = v end)
     toggle(eventCard, "Crystal and gemstone detection", function() return Config.CrystalNotifications end, function(v) Config.CrystalNotifications = v end)
     button(eventsPage, "Test general event", function() Runtime.EmitEvent({ name = "DENG Event Test", state = "active" }) end)
     button(eventsPage, "Test crystal event", function() Runtime.EmitCrystal({ name = "DENG Crystal Test", detail = "Crystal notification routing is working." }) end)
@@ -1721,6 +1854,8 @@ installFishDatabaseWatcher()
 installCatchRemoteWatcher()
 installAfkTracker()
 installFeatureStateTracker()
+installTargetedFeatureWatcher()
+installAntiAfk()
 
 for index, adapter in ipairs(type(Config.Adapters) == "table" and Config.Adapters or {}) do
     if type(adapter) == "function" then
