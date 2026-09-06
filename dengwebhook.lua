@@ -2,7 +2,7 @@
 -- Clean-room replacement based on static behavioral recovery.
 -- No hidden webhooks, license checks, remote code loading, or embedded credentials.
 
-local VERSION = "2.0.1"
+local VERSION = "2.1.0"
 
 local Config = {
     MainWebhook = "",
@@ -11,6 +11,12 @@ local Config = {
 
     BotName = "DENG",
     BotAvatar = "",
+    EmbedLayout = 1,
+    CatchTitleTemplate = "{rarity} Fish Caught",
+    CatchDescriptionTemplate = "{player} caught {fish}.",
+    FooterTemplate = "DENG Fish Webhook • {date}",
+    NotificationPrefix = "",
+    DefaultFishThumbnail = "https://i.ibb.co.com/q38LKrcJ/image.png",
     TimezoneOffsetSeconds = 7 * 60 * 60,
 
     CatchNotifications = true,
@@ -36,7 +42,7 @@ local Config = {
         Custom = true,
     },
 
-    CustomFishNames = {},
+    CustomFishNames = { "Sea Eater" },
     CustomMutations = {},
     MentionUserIds = {},
     MentionRoleIds = {},
@@ -378,6 +384,29 @@ local function timestampIso()
     return os.date("!%Y-%m-%dT%H:%M:%SZ", os.time())
 end
 
+local function jakartaDate()
+    return os.date("!%d %B %Y", os.time() + clampNumber(Config.TimezoneOffsetSeconds, -43200, 50400, 25200))
+end
+
+local function applyTemplate(template, variables)
+    local output = tostring(template or "")
+    output = output:gsub("{([%w_]+)}", function(key)
+        return safeText(variables[key] or "", 500)
+    end)
+    return safeText(output, 1000)
+end
+
+local function assetThumbnail(value)
+    value = trim(value)
+    if value == "" then return nil end
+    if value:match("^https://") then return value end
+    local id = value:match("rbxassetid://(%d+)") or value:match("[?&]id=(%d+)") or value:match("^(%d+)$")
+    if id then
+        return "https://www.roblox.com/asset-thumbnail/image?assetId=" .. id .. "&width=420&height=420&format=png"
+    end
+    return nil
+end
+
 local function duplicateKey(parts)
     local value = table.concat(parts, "|"):lower()
     local now = os.clock()
@@ -483,6 +512,14 @@ function Runtime.EmitCatch(data)
     if duplicateKey({ data.player, data.fish, data.weight, data.mutation, data.rarity }) then
         return false, "Duplicate catch"
     end
+    local fishRecord = Runtime.FindFish and Runtime.FindFish(data.fish) or nil
+    local thumbnail = assetThumbnail(data.thumbnail or data.image or (fishRecord and fishRecord.thumbnail) or "")
+        or assetThumbnail(Config.DefaultFishThumbnail)
+        or Config.DefaultFishThumbnail
+    local variables = {
+        player = data.player, fish = data.fish, weight = data.weight, mutation = data.mutation,
+        rarity = data.rarity, location = data.location or "Unknown", date = jakartaDate(), version = VERSION,
+    }
     local fields = {
         { name = "Fish", value = data.fish, inline = true },
         { name = "Rarity", value = data.rarity, inline = true },
@@ -495,19 +532,40 @@ function Runtime.EmitCatch(data)
     end
     local mentionUsers = normalizeSnowflakeList(Config.MentionUserIds)
     local mentionRoles = normalizeSnowflakeList(Config.MentionRoleIds)
+    local title = applyTemplate(Config.CatchTitleTemplate, variables)
+    local description = applyTemplate(Config.CatchDescriptionTemplate, variables)
+    local footer = applyTemplate(Config.FooterTemplate, variables)
+    local layout = math.floor(clampNumber(Config.EmbedLayout, 1, 3, 1))
+    local embed
+    if layout == 2 then
+        embed = {
+            author = { name = Config.NotificationPrefix ~= "" and Config.NotificationPrefix .. " DENG Fish It" or "DENG Fish It" },
+            title = title,
+            description = description .. "\n\n**Weight:** " .. variables.weight .. (variables.weight == "Unknown" and "" or " kg")
+                .. "\n**Mutation:** " .. variables.mutation .. "\n**Location:** " .. variables.location,
+            color = colorForRarity(data.rarity), thumbnail = { url = thumbnail }, timestamp = timestampIso(),
+            footer = { text = footer },
+        }
+    elseif layout == 3 then
+        embed = {
+            title = (Config.NotificationPrefix ~= "" and Config.NotificationPrefix .. " " or "") .. data.fish,
+            description = "**" .. data.rarity .. "** • " .. description,
+            color = colorForRarity(data.rarity), fields = fields, image = { url = thumbnail },
+            timestamp = timestampIso(), footer = { text = footer },
+        }
+    else
+        embed = {
+            title = (Config.NotificationPrefix ~= "" and Config.NotificationPrefix .. " " or "") .. title,
+            description = description, color = colorForRarity(data.rarity), fields = fields,
+            thumbnail = { url = thumbnail }, timestamp = timestampIso(), footer = { text = footer },
+        }
+    end
     local payload = {
         username = safeText(Config.BotName, 80),
         avatar_url = trim(Config.BotAvatar),
         content = buildMentionText(),
         allowed_mentions = { parse = Config.AllowEveryoneMention and { "everyone" } or {}, users = mentionUsers, roles = mentionRoles },
-        embeds = {{
-            title = "Fish Caught",
-            description = "A configured catch was detected.",
-            color = colorForRarity(data.rarity),
-            fields = fields,
-            timestamp = timestampIso(),
-            footer = { text = "DENG Fish Webhook v" .. VERSION },
-        }},
+        embeds = { embed },
     }
     queueSend(Config.MainWebhook, payload, "catch notification")
     Runtime.Stats.catches = Runtime.Stats.catches + 1
@@ -611,8 +669,9 @@ function Runtime.RegisterFish(record)
     Runtime.FishDatabase[key] = {
         name = name,
         rarity = normalizeRarity(record.rarity),
-        thumbnail = safeText(record.thumbnail or "", 500),
+        thumbnail = safeText(record.thumbnail or record.image or record.icon or record.assetId or "", 500),
         location = safeText(record.location or "", 120),
+        value = tonumber(record.value) or nil,
     }
     return true
 end
@@ -716,8 +775,17 @@ local function installCatchRemoteWatcher()
         direct.mutation = record.Mutation or record.mutation or direct.mutation or "None"
         direct.rarity = record.Rarity or record.rarity or tierRarity or direct.rarity or guessRarity(name)
         direct.location = record.Location or record.location or direct.location
+        direct.thumbnail = record.Thumbnail or record.thumbnail or record.Image or record.image
+            or record.Icon or record.icon or record.AssetId or record.assetId
         direct.source = source
         if direct.weight ~= "Unknown" then direct.weight = tostring(direct.weight) end
+        Runtime.RegisterFish({
+            name = direct.fish,
+            rarity = direct.rarity,
+            thumbnail = direct.thumbnail,
+            location = direct.location,
+            value = record.Value or record.value or record.Price or record.price,
+        })
         return Runtime.EmitCatch(direct)
     end
     local function inspectArguments(...)
@@ -759,6 +827,43 @@ local function installCatchRemoteWatcher()
     trackConnection(ReplicatedStorage.DescendantAdded:Connect(hook))
 end
 
+local function readAttribute(object, names)
+    for _, name in ipairs(names) do
+        local ok, value = pcall(function() return object:GetAttribute(name) end)
+        if ok and value ~= nil and value ~= "" then return value end
+    end
+    return nil
+end
+
+local function registerFishInstance(object)
+    if not object or object:IsA("RemoteEvent") or object:IsA("RemoteFunction") then return false end
+    local explicitName = readAttribute(object, { "FishName", "fishName", "DisplayName", "displayName" })
+    local rarity = readAttribute(object, { "Rarity", "rarity" })
+    local tier = tonumber(readAttribute(object, { "Tier", "tier" }))
+    local thumbnail = readAttribute(object, { "Thumbnail", "thumbnail", "Image", "image", "Icon", "icon", "AssetId", "assetId" })
+    local location = readAttribute(object, { "Location", "location", "Zone", "zone" })
+    local value = readAttribute(object, { "Value", "value", "Price", "price", "SellPrice", "sellPrice" })
+    if not explicitName and not rarity and not tier and not thumbnail and not location and not value then return false end
+    if not explicitName and not rarity and not tier then return false end
+    local tierRarity = ({ "Common", "Uncommon", "Rare", "Epic", "Legendary", "Mythical", "Secret", "Forgotten" })[tier or 0]
+    return Runtime.RegisterFish({
+        name = explicitName or object.Name,
+        rarity = rarity or tierRarity or guessRarity(object.Name),
+        thumbnail = thumbnail,
+        location = location,
+        value = value,
+    })
+end
+
+local function installFishDatabaseWatcher()
+    for _, object in ipairs(ReplicatedStorage:GetDescendants()) do
+        pcall(registerFishInstance, object)
+    end
+    trackConnection(ReplicatedStorage.DescendantAdded:Connect(function(object)
+        if Runtime.Running then pcall(registerFishInstance, object) end
+    end))
+end
+
 local function installAfkTracker()
     local UserInputService = game:GetService("UserInputService")
     trackConnection(UserInputService.InputBegan:Connect(function()
@@ -792,6 +897,12 @@ local function saveConfig()
         EventWebhook = Config.EventWebhook,
         BotName = Config.BotName,
         BotAvatar = Config.BotAvatar,
+        EmbedLayout = Config.EmbedLayout,
+        CatchTitleTemplate = Config.CatchTitleTemplate,
+        CatchDescriptionTemplate = Config.CatchDescriptionTemplate,
+        FooterTemplate = Config.FooterTemplate,
+        NotificationPrefix = Config.NotificationPrefix,
+        DefaultFishThumbnail = Config.DefaultFishThumbnail,
         CatchNotifications = Config.CatchNotifications,
         PlayerNotifications = Config.PlayerNotifications,
         EventNotifications = Config.EventNotifications,
@@ -834,7 +945,10 @@ local function loadConfig()
     end
     local allowedKeys = {
         MainWebhook = "string", PlayerWebhook = "string", EventWebhook = "string",
-        BotName = "string", BotAvatar = "string", CatchNotifications = "boolean",
+        BotName = "string", BotAvatar = "string", EmbedLayout = "number",
+        CatchTitleTemplate = "string", CatchDescriptionTemplate = "string",
+        FooterTemplate = "string", NotificationPrefix = "string", DefaultFishThumbnail = "string",
+        CatchNotifications = "boolean",
         PlayerNotifications = "boolean", EventNotifications = "boolean",
         AfkNotifications = "boolean", CrystalNotifications = "boolean",
         ServerLuckNotifications = "boolean", AdminEventNotifications = "boolean",
@@ -1278,6 +1392,16 @@ local function createGui()
     end
     input(catches, "Custom fish names (comma separated)", table.concat(Config.CustomFishNames, ", "), function(value, field) Config.CustomFishNames = splitCsv(value, 200); field.Text = table.concat(Config.CustomFishNames, ", ") end)
     input(catches, "Custom mutations (comma separated)", table.concat(Config.CustomMutations, ", "), function(value, field) Config.CustomMutations = splitCsv(value, 200); field.Text = table.concat(Config.CustomMutations, ", ") end)
+    local layoutCard = card(catches, "Embed layout and formatting")
+    input(layoutCard, "Embed layout (1, 2, or 3)", Config.EmbedLayout, function(value, field)
+        Config.EmbedLayout = math.floor(clampNumber(value, 1, 3, 1)); field.Text = tostring(Config.EmbedLayout)
+    end)
+    input(layoutCard, "Catch title template", Config.CatchTitleTemplate, function(value, field) Config.CatchTitleTemplate = safeText(value, 250); field.Text = Config.CatchTitleTemplate end)
+    input(layoutCard, "Catch description template", Config.CatchDescriptionTemplate, function(value, field) Config.CatchDescriptionTemplate = safeText(value, 500); field.Text = Config.CatchDescriptionTemplate end)
+    input(layoutCard, "Footer template", Config.FooterTemplate, function(value, field) Config.FooterTemplate = safeText(value, 250); field.Text = Config.FooterTemplate end)
+    input(layoutCard, "Notification prefix", Config.NotificationPrefix, function(value, field) Config.NotificationPrefix = safeText(value, 80); field.Text = Config.NotificationPrefix end)
+    input(layoutCard, "Fallback fish image URL or asset ID", Config.DefaultFishThumbnail, function(value, field) Config.DefaultFishThumbnail = trim(value); field.Text = Config.DefaultFishThumbnail end)
+    textLabel(layoutCard, "Template variables: {player}, {fish}, {weight}, {mutation}, {rarity}, {location}, {date}, {version}", 10, palette.muted, false).Size = UDim2.new(1, 0, 0, 34)
 
     local playersPage = newPage("Players", "Join, leave, avatar-ready identity, and inactivity monitoring.")
     local playerCard = card(playersPage, "Player tracking")
@@ -1351,6 +1475,7 @@ _G.DENGFishWebhook = Runtime
 
 installChatWatcher()
 installVisibleTextWatcher()
+installFishDatabaseWatcher()
 installCatchRemoteWatcher()
 installAfkTracker()
 
